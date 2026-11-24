@@ -115,7 +115,23 @@ export default function App() {
     [authToken, fetchAuthStatus]
   );
 
-  // Real-time WebSocket connection & auto-reconnect when authenticated
+  const refreshWorkspaceViaRest = useCallback(async () => {
+    if (!authToken) return;
+    try {
+      const [postsRes, settingsRes, logsRes] = await Promise.all([
+        apiFetch<{ posts: ScheduledPost[] }>('/api/posts'),
+        apiFetch<{ settings: PublisherSettings }>('/api/settings'),
+        apiFetch<{ logs: ActivityLogEntry[] }>('/api/logs'),
+      ]);
+      setPosts(postsRes.posts || []);
+      if (settingsRes.settings) setSettings(settingsRes.settings);
+      setLogs(logsRes.logs || []);
+    } catch {
+      // Handled by apiFetch on 401
+    }
+  }, [authToken, apiFetch]);
+
+  // Real-time WebSocket connection & REST initial load when authenticated
   useEffect(() => {
     if (!authToken) {
       setSocketConnected(false);
@@ -126,6 +142,7 @@ export default function App() {
       return;
     }
 
+    void refreshWorkspaceViaRest();
     let cancelled = false;
 
     const connect = () => {
@@ -254,7 +271,7 @@ export default function App() {
         wsRef.current = null;
       }
     };
-  }, [authToken]);
+  }, [authToken, refreshWorkspaceViaRest]);
 
   const handleAuthenticated = (token: string, email: string) => {
     setAuthToken(token);
@@ -301,13 +318,18 @@ export default function App() {
     setIsApplyingSlots(true);
     try {
       const updates = recomputePendingSlots(pendingPosts, settings.recurringTimes);
-      await apiFetch<{ posts: ScheduledPost[] }>(
+      const res = await apiFetch<{ posts: ScheduledPost[] }>(
         '/api/posts/apply-recurring-times',
         {
           method: 'POST',
           body: JSON.stringify({ updates }),
         }
       );
+      if (res.posts?.length) {
+        const byId = new Map(res.posts.map((p) => [p.id, p]));
+        setPosts((prev) => prev.map((p) => byId.get(p.id) ?? p));
+      }
+      if (!socketConnected) void refreshWorkspaceViaRest();
     } finally {
       setIsApplyingSlots(false);
     }
@@ -322,10 +344,18 @@ export default function App() {
     setIsGenerating(true);
     setGeneratorError(null);
     try {
-      await apiFetch<{ posts: ScheduledPost[] }>('/api/gemini/generate-monthly', {
+      const res = await apiFetch<{ posts: ScheduledPost[] }>('/api/gemini/generate-monthly', {
         method: 'POST',
         body: JSON.stringify(params),
       });
+      if (res.posts?.length) {
+        setPosts((prev) => {
+          const existingIds = new Set(prev.map((p) => p.id));
+          const additions = res.posts.filter((p) => !existingIds.has(p.id));
+          return [...prev, ...additions];
+        });
+      }
+      if (!socketConnected) void refreshWorkspaceViaRest();
     } catch (err: unknown) {
       setGeneratorError(
         err instanceof Error ? err.message : 'Failed to generate monthly schedule.'
@@ -345,10 +375,16 @@ export default function App() {
     scheduledAt: string;
     monthKey: string;
   }) => {
-    await apiFetch<{ post: ScheduledPost }>('/api/posts', {
+    const res = await apiFetch<{ post: ScheduledPost }>('/api/posts', {
       method: 'POST',
       body: JSON.stringify(payload),
     });
+    if (res.post) {
+      setPosts((prev) =>
+        prev.some((p) => p.id === res.post.id) ? prev : [...prev, res.post]
+      );
+    }
+    if (!socketConnected) void refreshWorkspaceViaRest();
   };
 
   const handleUpdatePost = async (
@@ -365,10 +401,14 @@ export default function App() {
       status?: 'PENDING';
     }
   ) => {
-    await apiFetch<{ post: ScheduledPost }>(`/api/posts/${encodeURIComponent(id)}`, {
+    const res = await apiFetch<{ post: ScheduledPost }>(`/api/posts/${encodeURIComponent(id)}`, {
       method: 'PATCH',
       body: JSON.stringify(updates),
     });
+    if (res.post) {
+      setPosts((prev) => prev.map((p) => (p.id === res.post.id ? res.post : p)));
+    }
+    if (!socketConnected) void refreshWorkspaceViaRest();
   };
 
   const handlePublishNow = async (id: string) => {
@@ -378,13 +418,17 @@ export default function App() {
       return next;
     });
     try {
-      await apiFetch<{ post: ScheduledPost }>(
+      const res = await apiFetch<{ post: ScheduledPost }>(
         `/api/posts/${encodeURIComponent(id)}/publish`,
         { method: 'POST' }
       );
+      if (res.post) {
+        setPosts((prev) => prev.map((p) => (p.id === res.post.id ? res.post : p)));
+      }
     } catch {
-      // Server persists FAILED status & logs activity via WebSocket
+      // Server persists FAILED status
     } finally {
+      if (!socketConnected) void refreshWorkspaceViaRest();
       setPublishingIds((prev) => {
         const next = new Set(prev);
         next.delete(id);
@@ -400,10 +444,14 @@ export default function App() {
       return next;
     });
     try {
-      await apiFetch<{ post: ScheduledPost }>('/api/gemini/regenerate-part', {
+      const res = await apiFetch<{ post: ScheduledPost }>('/api/gemini/regenerate-part', {
         method: 'POST',
         body: JSON.stringify({ id }),
       });
+      if (res.post) {
+        setPosts((prev) => prev.map((p) => (p.id === res.post.id ? res.post : p)));
+      }
+      if (!socketConnected) void refreshWorkspaceViaRest();
     } finally {
       setRegeneratingIds((prev) => {
         const next = new Set(prev);
@@ -417,14 +465,18 @@ export default function App() {
     await apiFetch<{ deletedId: string }>(`/api/posts/${encodeURIComponent(id)}`, {
       method: 'DELETE',
     });
+    setPosts((prev) => prev.filter((p) => p.id !== id));
+    if (!socketConnected) void refreshWorkspaceViaRest();
   };
 
   const handleClearLogs = async () => {
     await apiFetch<{ ok: boolean }>('/api/logs', { method: 'DELETE' });
+    setLogs([]);
   };
 
   const handleRunSchedulerNow = async () => {
     await apiFetch('/api/scheduler/run', { method: 'POST' });
+    if (!socketConnected) void refreshWorkspaceViaRest();
   };
 
   const handleNavigate = (sectionId: string) => {

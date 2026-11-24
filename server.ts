@@ -101,12 +101,13 @@ const activePublishingIds = new Set<string>();
 let nextSchedulerRunAt = new Date(Date.now() + SCHEDULER_INTERVAL_MS).toISOString();
 let lastSchedulerRunAt: string | null = null;
 
-async function startServer() {
+export async function createServerApp(options: { standalone?: boolean } = {}) {
+  const standalone = options.standalone ?? false;
   const app = express();
   app.use(express.json({ limit: '2mb' }));
 
-  const server = http.createServer(app);
-  const wss = new WebSocketServer({ server, path: '/ws' });
+  const server = standalone ? http.createServer(app) : null;
+  const wss = server ? new WebSocketServer({ server, path: '/ws' }) : null;
 
   const dbBoot = await initDatabase();
   if (!dbBoot.ok) {
@@ -114,6 +115,7 @@ async function startServer() {
   }
 
   function broadcast(event: { type: string; data?: unknown }) {
+    if (!wss) return;
     const payload = JSON.stringify(event);
     for (const client of wss.clients) {
       const sock = client as AuthedSocket;
@@ -181,54 +183,56 @@ async function startServer() {
     };
   }
 
-  wss.on('connection', (ws: AuthedSocket) => {
-    ws.isAuthenticated = false;
+  if (wss) {
+    wss.on('connection', (ws: AuthedSocket) => {
+      ws.isAuthenticated = false;
 
-    const authTimeout = setTimeout(() => {
-      if (!ws.isAuthenticated && ws.readyState === WebSocket.OPEN) {
-        ws.close(4001, 'Authentication timeout');
-      }
-    }, 8000);
-
-    ws.on('message', async (raw) => {
-      try {
-        const msg = JSON.parse(raw.toString()) as { type?: string; token?: string };
-        if (msg.type === 'auth') {
-          const payload = verifySessionToken(String(msg.token ?? ''));
-          if (!payload) {
-            ws.send(JSON.stringify({ type: 'auth:error', error: 'Invalid session token' }));
-            ws.close(4001, 'Unauthorized');
-            return;
-          }
-          clearTimeout(authTimeout);
-          ws.isAuthenticated = true;
-          ws.userEmail = payload.email;
-
-          const dbCheck = await initDatabase();
-          if (!dbCheck.ok) {
-            ws.send(
-              JSON.stringify({
-                type: 'error',
-                error: dbCheck.error || 'Database unavailable',
-              })
-            );
-            return;
-          }
-
-          const state = await loadFullWorkspaceState();
-          ws.send(JSON.stringify({ type: 'init', data: state }));
-        } else if (msg.type === 'ping' && ws.isAuthenticated) {
-          ws.send(JSON.stringify({ type: 'pong', ts: Date.now() }));
+      const authTimeout = setTimeout(() => {
+        if (!ws.isAuthenticated && ws.readyState === WebSocket.OPEN) {
+          ws.close(4001, 'Authentication timeout');
         }
-      } catch {
-        // Ignore malformed messages
-      }
-    });
+      }, 8000);
 
-    ws.on('close', () => {
-      clearTimeout(authTimeout);
+      ws.on('message', async (raw) => {
+        try {
+          const msg = JSON.parse(raw.toString()) as { type?: string; token?: string };
+          if (msg.type === 'auth') {
+            const payload = verifySessionToken(String(msg.token ?? ''));
+            if (!payload) {
+              ws.send(JSON.stringify({ type: 'auth:error', error: 'Invalid session token' }));
+              ws.close(4001, 'Unauthorized');
+              return;
+            }
+            clearTimeout(authTimeout);
+            ws.isAuthenticated = true;
+            ws.userEmail = payload.email;
+
+            const dbCheck = await initDatabase();
+            if (!dbCheck.ok) {
+              ws.send(
+                JSON.stringify({
+                  type: 'error',
+                  error: dbCheck.error || 'Database unavailable',
+                })
+              );
+              return;
+            }
+
+            const state = await loadFullWorkspaceState();
+            ws.send(JSON.stringify({ type: 'init', data: state }));
+          } else if (msg.type === 'ping' && ws.isAuthenticated) {
+            ws.send(JSON.stringify({ type: 'pong', ts: Date.now() }));
+          }
+        } catch {
+          // Ignore malformed messages
+        }
+      });
+
+      ws.on('close', () => {
+        clearTimeout(authTimeout);
+      });
     });
-  });
+  }
 
   async function publishPostById(
     postId: string,
@@ -444,9 +448,11 @@ async function startServer() {
     }
   }
 
-  setInterval(() => {
-    void runBackgroundScheduler('auto');
-  }, SCHEDULER_INTERVAL_MS);
+  if (standalone) {
+    setInterval(() => {
+      void runBackgroundScheduler('auto');
+    }, SCHEDULER_INTERVAL_MS);
+  }
 
   // ---------------- Public Auth & Health Routes ----------------
 
@@ -1244,35 +1250,40 @@ Create a fresh angle and stronger hook distinct from: "${post.seoTitle}".`,
     });
   });
 
-  // ---------------- Static / Vite Middleware ----------------
+  // ---------------- Static / Vite Middleware (Standalone Only) ----------------
 
-  if (process.env.NODE_ENV === 'production') {
-    const distPath = path.resolve(__dirname, 'dist');
-    if (fs.existsSync(distPath)) {
-      app.use(express.static(distPath));
-      app.get('/{*splat}', (_req: Request, res: Response) => {
-        res.sendFile(path.join(distPath, 'index.html'));
+  if (standalone && server) {
+    if (process.env.NODE_ENV === 'production') {
+      const distPath = path.resolve(__dirname, 'dist');
+      if (fs.existsSync(distPath)) {
+        app.use(express.static(distPath));
+        app.get('/{*splat}', (_req: Request, res: Response) => {
+          res.sendFile(path.join(distPath, 'index.html'));
+        });
+      }
+    } else {
+      const { createServer: createViteServer } = await import('vite');
+      const vite = await createViteServer({
+        server: { middlewareMode: true },
+        appType: 'spa',
       });
+      app.use(vite.middlewares);
     }
-  } else {
-    const { createServer: createViteServer } = await import('vite');
-    const vite = await createViteServer({
-      server: { middlewareMode: true },
-      appType: 'spa',
+
+    server.listen(PORT, '0.0.0.0', () => {
+      console.log(
+        `FB Series Auto-Publisher server + WebSocket running on http://0.0.0.0:${PORT}`
+      );
     });
-    app.use(vite.middlewares);
   }
 
-  server.listen(PORT, '0.0.0.0', () => {
-    console.log(
-      `FB Series Auto-Publisher server + WebSocket running on http://0.0.0.0:${PORT}`
-    );
-  });
-
   void getDbStatus();
+  return app;
 }
 
-startServer().catch((err) => {
-  console.error('Failed to start server:', err);
-  process.exit(1);
-});
+if (!process.env.VERCEL) {
+  createServerApp({ standalone: true }).catch((err) => {
+    console.error('Failed to start server:', err);
+    process.exit(1);
+  });
+}
