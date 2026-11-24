@@ -1,6 +1,6 @@
 {
   "name": "FB Series Auto-Publisher",
-  "description": "Web-based Facebook Page content studio and daily auto-scheduler powered by Gemini 2.5 Flash.",
+  "description": "Web-based Facebook Page content studio and daily auto-scheduler powered by Gemini 4 Flash.",
   "requestFramePermissions": [],
   "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
 }

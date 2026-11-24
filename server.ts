@@ -37,7 +37,7 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const PORT = Number(process.env.PORT || 3000);
-const GEMINI_MODEL = 'gemini-2.5-flash';
+const GEMINI_MODEL = 'gemini-4-hydrogen';
 const SCHEDULER_INTERVAL_MS = 15000;
 
 function makeId(prefix: string): string {
@@ -919,7 +919,7 @@ export async function createServerApp(options: { standalone?: boolean } = {}) {
       await recordLog(
         'info',
         'gemini',
-        `Generating ${slots.length} scheduled SEO posts with Gemini 2.5 Flash...`
+        `Generating ${slots.length} scheduled SEO posts with Gemini 4 Flash...`
       );
 
       const BATCH_SIZE = 8;
