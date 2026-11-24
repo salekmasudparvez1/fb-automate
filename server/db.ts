@@ -204,8 +204,27 @@ export function serializePost(row: DbPostRow) {
   };
 }
 
+export function getEnvFacebookCredentials(): {
+  pageId: string;
+  accessToken: string;
+} {
+  const pageId = (
+    process.env.FACEBOOK_PAGE_ID ||
+    process.env.FB_PAGE_ID ||
+    process.env.FACEBOOK_ID ||
+    ''
+  ).trim();
+  const accessToken = (
+    process.env.FACEBOOK_ACCESS_TOKEN ||
+    process.env.FB_ACCESS_TOKEN ||
+    process.env.FACEBOOK_SECRET ||
+    ''
+  ).trim();
+  return { pageId, accessToken };
+}
+
 export function serializeSettings(row: DbSettingsRow) {
-  const token = row.facebook_access_token || '';
+  const { pageId, accessToken: token } = getEnvFacebookCredentials();
   const maskedToken =
     token.length > 10
       ? `${token.slice(0, 6)}••••••${token.slice(-4)}`
@@ -214,7 +233,7 @@ export function serializeSettings(row: DbSettingsRow) {
         : '';
 
   return {
-    facebookPageId: row.facebook_page_id || '',
+    facebookPageId: pageId,
     hasAccessToken: token.length > 0,
     maskedAccessToken: maskedToken,
     autoPublishEnabled: Boolean(row.auto_publish_enabled),

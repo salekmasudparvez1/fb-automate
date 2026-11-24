@@ -1,5 +1,6 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
+  AlertTriangle,
   FlaskConical,
   Loader2,
   LogOut,
@@ -14,7 +15,10 @@ import { LoginScreen } from './components/LoginScreen';
 import { MonthlyPlannerPanel } from './components/MonthlyPlannerPanel';
 import { MonthlyScheduleTable } from './components/MonthlyScheduleTable';
 import { ActivityConsole } from './components/ActivityConsole';
-import { SettingsModal } from './components/SettingsModal';
+import {
+  SettingsModal,
+  type FacebookVerifyResult,
+} from './components/SettingsModal';
 import type {
   ActivityLogEntry,
   AuthStatus,
@@ -372,9 +376,6 @@ export default function App() {
   };
 
   const handleSaveSettings = async (payload: {
-    facebookPageId?: string;
-    facebookAccessToken?: string;
-    clearAccessToken?: boolean;
     autoPublishEnabled?: boolean;
     dryRunMode?: boolean;
     recurringTimes?: string[];
@@ -384,6 +385,12 @@ export default function App() {
       body: JSON.stringify(payload),
     });
     setSettings(res.settings);
+  };
+
+  const handleVerifyFacebookConnection = async () => {
+    return apiFetch<FacebookVerifyResult>('/api/facebook/verify', {
+      method: 'POST',
+    });
   };
 
   const handleApplySlotsToPending = async () => {
@@ -594,10 +601,15 @@ export default function App() {
   };
 
   const counts = useMemo(() => {
+    const postedAll = posts.filter((p) => p.status === 'POSTED');
+    const simulated = postedAll.filter((p) => p.isSimulated).length;
+    const livePosted = postedAll.length - simulated;
     return {
       all: posts.length,
       pending: posts.filter((p) => p.status === 'PENDING').length,
-      posted: posts.filter((p) => p.status === 'POSTED').length,
+      posted: postedAll.length,
+      livePosted,
+      simulated,
       failed: posts.filter((p) => p.status === 'FAILED').length,
     };
   }, [posts]);
@@ -654,9 +666,14 @@ export default function App() {
               </div>
             </div>
             <div className="sm:px-4">
-              <div className="text-xs text-slate-500">Published</div>
+              <div className="text-xs text-slate-500">Published to FB</div>
               <div className="mt-0.5 font-display text-xl font-bold font-mono tabular-nums text-emerald-700">
-                {counts.posted}
+                {counts.livePosted}
+                {counts.simulated > 0 && (
+                  <span className="ml-1.5 text-xs font-medium text-amber-700">
+                    ({counts.simulated} sim)
+                  </span>
+                )}
               </div>
             </div>
             <div className="sm:pl-4">
@@ -764,7 +781,45 @@ export default function App() {
       </div>
 
       {/* Main Studio Grid */}
-      <main className="max-w-[1440px] mx-auto px-4 sm:px-6 lg:px-8 py-6 lg:py-8">
+      <main className="max-w-[1440px] mx-auto px-4 sm:px-6 lg:px-8 py-6 lg:py-8 space-y-6">
+        {(settings.dryRunMode || !settings.facebookPageId || !settings.hasAccessToken) && (
+          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 px-4 py-3 bg-amber-50 border border-amber-200 rounded-xl text-xs text-amber-950">
+            <div className="flex items-start gap-2.5">
+              <AlertTriangle className="w-4 h-4 text-amber-700 shrink-0 mt-0.5" />
+              <div>
+                <div className="font-semibold">
+                  {settings.dryRunMode
+                    ? 'Dry Run (Simulation Mode) is ON — posts will NOT appear on your Facebook Page'
+                    : 'Facebook Page credentials required for live publishing'}
+                </div>
+                <div className="mt-0.5 text-amber-900">
+                  {settings.facebookPageId && settings.hasAccessToken
+                    ? 'FACEBOOK_PAGE_ID & FACEBOOK_ACCESS_TOKEN env secrets detected. Turn Dry Run OFF to publish live, and click "Re-queue" on any SIMULATED row.'
+                    : 'Add FACEBOOK_PAGE_ID and FACEBOOK_ACCESS_TOKEN in Settings > Secrets (or .env), then test the connection and switch Dry Run OFF.'}
+                </div>
+              </div>
+            </div>
+            <div className="flex items-center gap-2 shrink-0">
+              <button
+                type="button"
+                onClick={() => setIsSettingsOpen(true)}
+                className="px-3 py-1.5 text-xs font-semibold text-amber-950 bg-white border border-amber-300 hover:bg-amber-100 rounded-lg whitespace-nowrap cursor-pointer"
+              >
+                Open FB Settings
+              </button>
+              {settings.dryRunMode && settings.facebookPageId && settings.hasAccessToken && (
+                <button
+                  type="button"
+                  onClick={() => void handleSaveSettings({ dryRunMode: false })}
+                  className="px-3 py-1.5 text-xs font-semibold text-white bg-emerald-700 hover:bg-emerald-800 rounded-lg whitespace-nowrap cursor-pointer"
+                >
+                  Go Live (Dry Run OFF)
+                </button>
+              )}
+            </div>
+          </div>
+        )}
+
         <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-start">
           <div className="lg:col-span-5 xl:col-span-4 space-y-6">
             <MonthlyPlannerPanel
@@ -809,6 +864,7 @@ export default function App() {
         isOpen={isSettingsOpen}
         settings={settings}
         onClose={() => setIsSettingsOpen(false)}
+        onVerifyConnection={handleVerifyFacebookConnection}
         onSave={handleSaveSettings}
       />
     </div>

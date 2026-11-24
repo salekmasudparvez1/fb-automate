@@ -1,15 +1,33 @@
 import React, { useState, useEffect } from 'react';
-import { Eye, EyeOff, X, ShieldCheck, Check, Loader2 } from 'lucide-react';
+import {
+  AlertTriangle,
+  Check,
+  CheckCircle2,
+  KeyRound,
+  Loader2,
+  PlugZap,
+  ShieldCheck,
+  X,
+} from 'lucide-react';
 import type { PublisherSettings } from '../types';
+
+export interface FacebookVerifyResult {
+  ok: boolean;
+  pageId: string;
+  pageName: string;
+  pageLink: string;
+  isPublished: boolean;
+  isPageToken: boolean;
+  tokenOwnerName: string | null;
+  warnings: string[];
+}
 
 interface SettingsModalProps {
   isOpen: boolean;
   settings: PublisherSettings;
   onClose: () => void;
+  onVerifyConnection: () => Promise<FacebookVerifyResult>;
   onSave: (payload: {
-    facebookPageId: string;
-    facebookAccessToken?: string;
-    clearAccessToken?: boolean;
     autoPublishEnabled: boolean;
     dryRunMode: boolean;
   }) => Promise<void>;
@@ -19,39 +37,50 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   isOpen,
   settings,
   onClose,
+  onVerifyConnection,
   onSave,
 }) => {
-  const [facebookPageId, setFacebookPageId] = useState(settings.facebookPageId);
-  const [newToken, setNewToken] = useState('');
-  const [clearToken, setClearToken] = useState(false);
   const [autoPublishEnabled, setAutoPublishEnabled] = useState(
     settings.autoPublishEnabled
   );
   const [dryRunMode, setDryRunMode] = useState(settings.dryRunMode);
-  const [showToken, setShowToken] = useState(false);
   const [isSaving, setIsSaving] = useState(false);
+  const [isVerifying, setIsVerifying] = useState(false);
+  const [verifyResult, setVerifyResult] = useState<FacebookVerifyResult | null>(null);
+  const [verifyError, setVerifyError] = useState<string | null>(null);
 
   useEffect(() => {
     if (isOpen) {
-      setFacebookPageId(settings.facebookPageId);
-      setNewToken('');
-      setClearToken(false);
       setAutoPublishEnabled(settings.autoPublishEnabled);
       setDryRunMode(settings.dryRunMode);
-      setShowToken(false);
+      setVerifyResult(null);
+      setVerifyError(null);
     }
   }, [isOpen, settings]);
 
   if (!isOpen) return null;
+
+  const handleTestConnection = async () => {
+    setIsVerifying(true);
+    setVerifyResult(null);
+    setVerifyError(null);
+    try {
+      const res = await onVerifyConnection();
+      setVerifyResult(res);
+    } catch (err: unknown) {
+      setVerifyError(
+        err instanceof Error ? err.message : 'Failed to verify Facebook connection.'
+      );
+    } finally {
+      setIsVerifying(false);
+    }
+  };
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setIsSaving(true);
     try {
       await onSave({
-        facebookPageId: facebookPageId.trim(),
-        facebookAccessToken: newToken.trim() || undefined,
-        clearAccessToken: clearToken,
         autoPublishEnabled,
         dryRunMode,
       });
@@ -61,6 +90,10 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
     }
   };
 
+  const hasEnvCredentials = Boolean(
+    settings.facebookPageId && settings.hasAccessToken
+  );
+
   return (
     <div
       className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/40 backdrop-blur-[2px] p-4"
@@ -68,17 +101,17 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
       aria-modal="true"
       aria-labelledby="settings-modal-title"
     >
-      <div className="w-full max-w-lg bg-white border border-slate-200 rounded-xl shadow-lg overflow-hidden">
+      <div className="w-full max-w-lg bg-white border border-slate-200 rounded-xl shadow-lg overflow-hidden max-h-[90vh] flex flex-col">
         <div className="flex items-center justify-between px-6 py-4 border-b border-slate-200">
           <div>
             <h2
               id="settings-modal-title"
               className="font-display text-lg font-bold text-slate-900"
             >
-              Facebook Page &amp; Background Scheduler Settings
+              Facebook Environment &amp; Scheduler Settings
             </h2>
             <p className="text-xs text-slate-500 mt-0.5">
-              Persisted in PostgreSQL so the server background scheduler continues running 24/7.
+              Facebook credentials are read from server environment secrets. Scheduler toggles persist in PostgreSQL.
             </p>
           </div>
           <button
@@ -91,82 +124,95 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
           </button>
         </div>
 
-        <form onSubmit={handleSubmit} className="p-6 space-y-4">
-          <div>
-            <label
-              htmlFor="fb-page-id"
-              className="block text-sm font-medium text-slate-800 mb-1.5"
-            >
-              Facebook Page ID
-            </label>
-            <input
-              id="fb-page-id"
-              type="text"
-              value={facebookPageId}
-              onChange={(e) => setFacebookPageId(e.target.value)}
-              placeholder="e.g., 104928374651234"
-              className="w-full px-3.5 py-2 text-sm font-mono text-slate-900 bg-white border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-600/20 focus:border-blue-600"
-            />
+        <form onSubmit={handleSubmit} className="p-6 space-y-4 overflow-y-auto">
+          {/* Read-only Environment Secrets Status */}
+          <div className="p-4 bg-slate-50 border border-slate-200 rounded-lg space-y-2.5">
+            <div className="flex items-center justify-between gap-2">
+              <div className="flex items-center gap-1.5 text-xs font-semibold text-slate-800">
+                <KeyRound className="w-3.5 h-3.5 text-blue-700" />
+                <span>Server Environment Secrets</span>
+              </div>
+              <span
+                className={`px-2 py-0.5 text-[11px] font-semibold rounded-full border ${
+                  hasEnvCredentials
+                    ? 'bg-emerald-50 text-emerald-800 border-emerald-200'
+                    : 'bg-amber-50 text-amber-800 border-amber-200'
+                }`}
+              >
+                {hasEnvCredentials ? 'Configured' : 'Missing Secrets'}
+              </span>
+            </div>
+
+            <div className="space-y-1.5 text-xs">
+              <div className="flex items-center justify-between gap-3 py-1 border-b border-slate-200/70">
+                <span className="font-mono text-slate-600">FACEBOOK_PAGE_ID</span>
+                <span className="font-mono font-medium text-slate-900">
+                  {settings.facebookPageId || 'Not set'}
+                </span>
+              </div>
+              <div className="flex items-center justify-between gap-3 py-1">
+                <span className="font-mono text-slate-600">FACEBOOK_ACCESS_TOKEN</span>
+                <span className="font-mono font-medium text-slate-900">
+                  {settings.hasAccessToken ? settings.maskedAccessToken : 'Not set'}
+                </span>
+              </div>
+            </div>
+
+            <p className="text-[11px] text-slate-500 leading-relaxed">
+              Manage these values in your platform <strong>Secrets / Environment Variables</strong> panel (no secrets are stored in browser inputs).
+            </p>
           </div>
 
-          <div>
-            <div className="flex items-center justify-between mb-1.5">
-              <label
-                htmlFor="fb-access-token"
-                className="block text-sm font-medium text-slate-800"
-              >
-                Facebook Page Access Token
-              </label>
-              {settings.hasAccessToken && !clearToken && (
-                <span className="text-xs font-mono text-emerald-700">
-                  Saved: {settings.maskedAccessToken}
-                </span>
+          <div className="flex items-center justify-between gap-3">
+            <button
+              type="button"
+              disabled={isVerifying || !hasEnvCredentials}
+              onClick={() => void handleTestConnection()}
+              className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold text-slate-800 bg-slate-100 hover:bg-slate-200 disabled:opacity-50 border border-slate-300 rounded-lg cursor-pointer"
+            >
+              {isVerifying ? (
+                <Loader2 className="w-3.5 h-3.5 animate-spin text-blue-700" />
+              ) : (
+                <PlugZap className="w-3.5 h-3.5 text-blue-700" />
               )}
-            </div>
-            <div className="relative">
-              <input
-                id="fb-access-token"
-                type={showToken ? 'text' : 'password'}
-                value={newToken}
-                onChange={(e) => {
-                  setNewToken(e.target.value);
-                  setClearToken(false);
-                }}
-                placeholder={
-                  settings.hasAccessToken && !clearToken
-                    ? 'Leave blank to keep existing token'
-                    : 'Paste Page Access Token (EAAB...)'
-                }
-                className="w-full pl-3.5 pr-10 py-2 text-sm font-mono text-slate-900 bg-white border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-600/20 focus:border-blue-600"
-              />
-              <button
-                type="button"
-                onClick={() => setShowToken((prev) => !prev)}
-                aria-label={showToken ? 'Hide token' : 'Show token'}
-                className="absolute right-2.5 top-1/2 -translate-y-1/2 p-1 text-slate-400 hover:text-slate-700 cursor-pointer"
-              >
-                {showToken ? (
-                  <EyeOff className="w-4 h-4" />
-                ) : (
-                  <Eye className="w-4 h-4" />
-                )}
-              </button>
-            </div>
-            <div className="mt-1.5 flex items-center justify-between text-xs text-slate-500">
-              <span>
-                Requires <span className="font-mono">pages_manage_posts</span> scope.
-              </span>
-              {settings.hasAccessToken && !clearToken && (
-                <button
-                  type="button"
-                  onClick={() => setClearToken(true)}
-                  className="text-red-600 hover:underline cursor-pointer"
-                >
-                  Clear stored token
-                </button>
-              )}
-            </div>
+              <span>{isVerifying ? 'Testing Graph API...' : 'Test Facebook Connection'}</span>
+            </button>
           </div>
+
+          {verifyError && (
+            <div className="flex items-start gap-2 p-3 text-xs text-red-800 bg-red-50 border border-red-200 rounded-lg">
+              <AlertTriangle className="w-4 h-4 text-red-600 shrink-0 mt-0.5" />
+              <span>{verifyError}</span>
+            </div>
+          )}
+
+          {verifyResult && (
+            <div
+              className={`p-3 text-xs rounded-lg border space-y-1.5 ${
+                verifyResult.warnings.length > 0
+                  ? 'bg-amber-50 border-amber-200 text-amber-900'
+                  : 'bg-emerald-50 border-emerald-200 text-emerald-900'
+              }`}
+            >
+              <div className="flex items-center gap-1.5 font-semibold">
+                <CheckCircle2 className="w-4 h-4 shrink-0" />
+                <span>
+                  Connected to Page: {verifyResult.pageName} ({verifyResult.pageId})
+                </span>
+              </div>
+              <div className="text-[11px]">
+                Token Type:{' '}
+                <span className="font-mono font-semibold">
+                  {verifyResult.isPageToken ? 'Valid Page Token' : 'User Token (Check Warning)'}
+                </span>
+              </div>
+              {verifyResult.warnings.map((w, i) => (
+                <div key={i} className="text-[11px] text-amber-800">
+                  • {w}
+                </div>
+              ))}
+            </div>
+          )}
 
           <div className="pt-2 space-y-3 border-t border-slate-100">
             <label className="flex items-center justify-between gap-4 cursor-pointer">
@@ -192,7 +238,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                   Dry Run / Simulation Mode
                 </div>
                 <div className="text-xs text-slate-500">
-                  Test recurring time slots safely without posting to live Facebook.
+                  When ON, posts are only simulated locally and <strong>do NOT appear on Facebook</strong>. Turn OFF to publish live.
                 </div>
               </div>
               <input
@@ -207,11 +253,11 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
           <div className="flex items-start gap-2 p-3 bg-slate-50 border border-slate-200 rounded-lg text-xs text-slate-600">
             <ShieldCheck className="w-4 h-4 text-slate-500 shrink-0 mt-0.5" />
             <span>
-              Live mode posts directly from the backend to{' '}
+              Live mode posts to{' '}
               <span className="font-mono text-slate-800">
                 https://graph.facebook.com/v27.0/&#123;pageId&#125;/feed
               </span>
-              .
+              . Note: if your Meta App is in Development Mode, posts are only visible to App Admins/Testers until the App is set to Live.
             </span>
           </div>
 

@@ -3,9 +3,12 @@ import {
   CheckCircle2,
   Clock,
   Edit3,
+  ExternalLink,
+  FlaskConical,
   Loader2,
   Plus,
   RefreshCw,
+  RotateCcw,
   Search,
   Send,
   Trash2,
@@ -416,12 +419,19 @@ export const MonthlyScheduleTable: React.FC<MonthlyScheduleTableProps> = ({
                     </td>
 
                     <td className="py-3.5 px-4 whitespace-nowrap">
-                      <span
-                        className={`inline-flex items-center gap-1 px-2 py-0.5 text-[11px] font-semibold rounded-full border ${statusMeta.className}`}
-                      >
-                        <StatusIcon className="w-3 h-3" />
-                        <span>{statusMeta.label}</span>
-                      </span>
+                      {post.status === 'POSTED' && post.isSimulated ? (
+                        <span className="inline-flex items-center gap-1 px-2 py-0.5 text-[11px] font-semibold rounded-full border bg-amber-50 text-amber-800 border-amber-300">
+                          <FlaskConical className="w-3 h-3" />
+                          <span>SIMULATED</span>
+                        </span>
+                      ) : (
+                        <span
+                          className={`inline-flex items-center gap-1 px-2 py-0.5 text-[11px] font-semibold rounded-full border ${statusMeta.className}`}
+                        >
+                          <StatusIcon className="w-3 h-3" />
+                          <span>{statusMeta.label}</span>
+                        </span>
+                      )}
                     </td>
 
                     <td className="py-3.5 px-4 whitespace-nowrap">
@@ -430,15 +440,33 @@ export const MonthlyScheduleTable: React.FC<MonthlyScheduleTableProps> = ({
                           <div className="font-mono tabular-nums text-slate-800">
                             {formatDateTimeDisplay(post.publishedAt)}
                           </div>
-                          {post.fbPostId && (
-                            <div className="mt-0.5 font-mono tabular-nums text-[11px] text-emerald-700">
-                              {post.fbPostId}
-                              {post.isSimulated && (
-                                <span className="ml-1 font-sans text-amber-700">
-                                  (Sim)
-                                </span>
-                              )}
+                          {post.isSimulated ? (
+                            <div className="mt-0.5 flex items-center gap-2 text-[11px] text-amber-700">
+                              <span>Dry Run (not on FB)</span>
+                              <button
+                                type="button"
+                                onClick={() =>
+                                  void onUpdatePost(post.id, { status: 'PENDING' })
+                                }
+                                title="Reset back to PENDING so you can publish live to Facebook"
+                                className="inline-flex items-center gap-0.5 font-medium text-blue-700 hover:underline cursor-pointer"
+                              >
+                                <RotateCcw className="w-3 h-3" />
+                                <span>Re-queue</span>
+                              </button>
                             </div>
+                          ) : (
+                            post.fbPostId && (
+                              <a
+                                href={`https://www.facebook.com/${encodeURIComponent(post.fbPostId)}`}
+                                target="_blank"
+                                rel="noreferrer"
+                                className="mt-0.5 inline-flex items-center gap-1 font-mono tabular-nums text-[11px] text-emerald-700 hover:underline"
+                              >
+                                <span>{post.fbPostId}</span>
+                                <ExternalLink className="w-3 h-3" />
+                              </a>
+                            )
                           )}
                         </div>
                       ) : (

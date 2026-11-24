@@ -9,6 +9,7 @@ import { WebSocketServer, WebSocket } from 'ws';
 import { GoogleGenAI, Type } from '@google/genai';
 import {
   getDbStatus,
+  getEnvFacebookCredentials,
   getPool,
   initDatabase,
   serializeLog,
@@ -281,14 +282,23 @@ export async function createServerApp(options: { standalone?: boolean } = {}) {
       ),
     ]);
 
+    const envCreds = getEnvFacebookCredentials();
+    const fallbackToken = envCreds.accessToken;
+    const maskedToken =
+      fallbackToken.length > 10
+        ? `${fallbackToken.slice(0, 6)}••••••${fallbackToken.slice(-4)}`
+        : fallbackToken
+          ? '••••••••'
+          : '';
+
     return {
       posts: postsRes.rows.map(serializePost),
       settings: settingsRes.rows[0]
         ? serializeSettings(settingsRes.rows[0])
         : {
-            facebookPageId: '',
-            hasAccessToken: false,
-            maskedAccessToken: '',
+            facebookPageId: envCreds.pageId,
+            hasAccessToken: fallbackToken.length > 0,
+            maskedAccessToken: maskedToken,
             autoPublishEnabled: true,
             dryRunMode: true,
             recurringTimes: ['09:00', '15:00', '18:00'],
@@ -379,8 +389,7 @@ export async function createServerApp(options: { standalone?: boolean } = {}) {
       );
       const settingsRow = settingsRes.rows[0];
       const isDryRun = settingsRow ? Boolean(settingsRow.dry_run_mode) : true;
-      const pageId = (settingsRow?.facebook_page_id || '').trim();
-      const accessToken = (settingsRow?.facebook_access_token || '').trim();
+      const { pageId, accessToken } = getEnvFacebookCredentials();
 
       if (isDryRun) {
         const simPage = pageId || 'sim_page';
@@ -400,17 +409,17 @@ export async function createServerApp(options: { standalone?: boolean } = {}) {
         const updated = serializePost(updatedRes.rows[0]);
         broadcast({ type: 'post:updated', data: updated });
         await recordLog(
-          'success',
+          'warning',
           'facebook',
-          `[DRY RUN] ${source === 'scheduler' ? 'Auto-published' : 'Published'} "${updated.topicName}" (${updated.slotTime})`,
-          `Simulated FB Post ID: ${simPostId}`
+          `[DRY RUN / NOT ON FB] ${source === 'scheduler' ? 'Simulated auto-publish' : 'Simulated publish'} for "${updated.topicName}" (${updated.slotTime}). Turn OFF Dry Run to post live.`,
+          `Simulated ID: ${simPostId}`
         );
         return updated;
       }
 
       if (!pageId || !accessToken) {
         const errMsg =
-          'Missing Facebook Page ID or Access Token. Configure credentials in Page Settings or enable Dry Run mode.';
+          'Missing FACEBOOK_PAGE_ID or FACEBOOK_ACCESS_TOKEN in server environment secrets. Add them in Settings > Secrets.';
         const failRes = await pool.query<DbPostRow>(
           `UPDATE scheduled_posts
            SET status = 'FAILED',
@@ -437,6 +446,7 @@ export async function createServerApp(options: { standalone?: boolean } = {}) {
       )}/feed`;
       const params = new URLSearchParams();
       params.append('message', message);
+      params.append('published', 'true');
       params.append('access_token', accessToken);
 
       const fbRes = await fetch(graphUrl, {
@@ -1302,21 +1312,6 @@ Create a fresh angle and stronger hook distinct from: "${post.seoTitle}".`,
       );
       const current = currentRes.rows[0];
 
-      const facebookPageId =
-        req.body?.facebookPageId !== undefined
-          ? String(req.body.facebookPageId).trim()
-          : current.facebook_page_id;
-
-      let facebookAccessToken = current.facebook_access_token;
-      if (req.body?.clearAccessToken === true) {
-        facebookAccessToken = '';
-      } else if (
-        typeof req.body?.facebookAccessToken === 'string' &&
-        req.body.facebookAccessToken.trim().length > 0
-      ) {
-        facebookAccessToken = req.body.facebookAccessToken.trim();
-      }
-
       const autoPublishEnabled =
         req.body?.autoPublishEnabled !== undefined
           ? Boolean(req.body.autoPublishEnabled)
@@ -1346,21 +1341,13 @@ Create a fresh angle and stronger hook distinct from: "${post.seoTitle}".`,
 
       const updatedRes = await pool.query<DbSettingsRow>(
         `UPDATE publisher_settings
-         SET facebook_page_id = $1,
-             facebook_access_token = $2,
-             auto_publish_enabled = $3,
-             dry_run_mode = $4,
-             recurring_times = $5::jsonb,
+         SET auto_publish_enabled = $1,
+             dry_run_mode = $2,
+             recurring_times = $3::jsonb,
              updated_at = NOW()
          WHERE id = 1
          RETURNING *`,
-        [
-          facebookPageId,
-          facebookAccessToken,
-          autoPublishEnabled,
-          dryRunMode,
-          JSON.stringify(recurringTimes),
-        ]
+        [autoPublishEnabled, dryRunMode, JSON.stringify(recurringTimes)]
       );
 
       const serialized = serializeSettings(updatedRes.rows[0]);
@@ -1374,6 +1361,75 @@ Create a fresh angle and stronger hook distinct from: "${post.seoTitle}".`,
     } catch (err: unknown) {
       return res.status(500).json({
         error: err instanceof Error ? err.message : 'Failed to update settings.',
+      });
+    }
+  });
+
+  app.post('/api/facebook/verify', requireAuth, async (_req: AuthenticatedRequest, res: Response) => {
+    try {
+      const { pageId, accessToken } = getEnvFacebookCredentials();
+
+      if (!pageId || !accessToken) {
+        return res.status(400).json({
+          error:
+            'FACEBOOK_PAGE_ID and FACEBOOK_ACCESS_TOKEN are not configured in server environment secrets (Settings > Secrets).',
+        });
+      }
+
+      const [pageRes, meRes] = await Promise.all([
+        fetch(
+          `https://graph.facebook.com/v27.0/${encodeURIComponent(pageId)}?fields=id,name,link,is_published&access_token=${encodeURIComponent(accessToken)}`
+        ),
+        fetch(
+          `https://graph.facebook.com/v27.0/me?fields=id,name&access_token=${encodeURIComponent(accessToken)}`
+        ),
+      ]);
+
+      const pageJson = (await pageRes.json().catch(() => ({}))) as {
+        id?: string;
+        name?: string;
+        link?: string;
+        is_published?: boolean;
+        error?: { message?: string };
+      };
+      const meJson = (await meRes.json().catch(() => ({}))) as {
+        id?: string;
+        name?: string;
+        error?: { message?: string };
+      };
+
+      if (!pageRes.ok || pageJson.error || !pageJson.id) {
+        const errMsg =
+          pageJson.error?.message ||
+          `Facebook Graph API returned HTTP ${pageRes.status}`;
+        return res.status(400).json({ error: errMsg });
+      }
+
+      const isPageToken = Boolean(meJson.id && pageJson.id && meJson.id === pageJson.id);
+      const warnings: string[] = [];
+
+      if (!isPageToken) {
+        warnings.push(
+          `Token belongs to "${meJson.name || meJson.id || 'a User'}" rather than the Page itself. For public Page posts, generate a Page Access Token (not a User Token) with pages_manage_posts & pages_read_engagement.`
+        );
+      }
+      if (pageJson.is_published === false) {
+        warnings.push('Your Facebook Page itself is currently set to Unpublished.');
+      }
+
+      return res.json({
+        ok: true,
+        pageId: pageJson.id,
+        pageName: pageJson.name || pageJson.id,
+        pageLink: pageJson.link || `https://www.facebook.com/${pageJson.id}`,
+        isPublished: pageJson.is_published !== false,
+        isPageToken,
+        tokenOwnerName: meJson.name || null,
+        warnings,
+      });
+    } catch (err: unknown) {
+      return res.status(500).json({
+        error: err instanceof Error ? err.message : 'Facebook verification failed.',
       });
     }
   });
