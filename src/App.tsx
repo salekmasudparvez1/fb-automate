@@ -68,9 +68,15 @@ export default function App() {
       if (token) {
         headers.Authorization = `Bearer ${token}`;
       }
-      const res = await fetch('/api/auth/status', { headers });
+      const res = await fetch('/api/auth/status', {
+        headers,
+        credentials: 'include',
+      });
       const data = (await res.json()) as AuthStatus;
       setAuthStatus(data);
+      if (data.authenticated && data.token) {
+        setAuthToken(data.token);
+      }
     } catch {
       setAuthStatus({
         authenticated: false,
@@ -96,11 +102,16 @@ export default function App() {
       }
       const headers = new Headers(options.headers);
       headers.set('Authorization', `Bearer ${authToken}`);
+      headers.set('X-Requested-With', 'XMLHttpRequest');
       if (options.body && !headers.has('Content-Type')) {
         headers.set('Content-Type', 'application/json');
       }
 
-      const res = await fetch(url, { ...options, headers });
+      const res = await fetch(url, {
+        ...options,
+        headers,
+        credentials: 'include',
+      });
       const data = (await res.json().catch(() => ({}))) as T & { error?: string };
       if (res.status === 401) {
         setAuthToken(null);
@@ -289,7 +300,16 @@ export default function App() {
     );
   };
 
-  const handleSignOut = () => {
+  const handleSignOut = async () => {
+    try {
+      await fetch('/api/auth/logout', {
+        method: 'POST',
+        credentials: 'include',
+        headers: { 'X-Requested-With': 'XMLHttpRequest' },
+      });
+    } catch {
+      // Ignore network errors during sign out
+    }
     setAuthToken(null);
     setPosts([]);
     setLogs([]);

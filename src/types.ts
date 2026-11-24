@@ -53,6 +53,7 @@ export type QueueFilter = 'ALL' | 'PENDING' | 'POSTED' | 'FAILED';
 export interface AuthStatus {
   authenticated: boolean;
   email: string | null;
+  token?: string | null;
   allowedEmail: string;
   setupRequired: boolean;
   dbConnected: boolean;

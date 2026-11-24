@@ -19,11 +19,14 @@ import {
   type DbSettingsRow,
 } from './server/db.ts';
 import {
+  clearSessionCookie,
   createSessionToken,
+  extractTokenFromRequest,
   getAllowedEmail,
   hashPassword,
   isSetupRequired,
   requireAuth,
+  setSessionCookie,
   verifyPlaintextConstantTime,
   verifyScryptPassword,
   verifySessionToken,
@@ -197,7 +200,7 @@ export async function createServerApp(options: { standalone?: boolean } = {}) {
         try {
           const msg = JSON.parse(raw.toString()) as { type?: string; token?: string };
           if (msg.type === 'auth') {
-            const payload = verifySessionToken(String(msg.token ?? ''));
+            const payload = await verifySessionToken(String(msg.token ?? ''));
             if (!payload) {
               ws.send(JSON.stringify({ type: 'auth:error', error: 'Invalid session token' }));
               ws.close(4001, 'Unauthorized');
@@ -468,16 +471,14 @@ export async function createServerApp(options: { standalone?: boolean } = {}) {
 
   app.get('/api/auth/status', async (req: Request, res: Response) => {
     try {
-      const authHeader = req.headers.authorization;
-      const token = authHeader?.startsWith('Bearer ')
-        ? authHeader.slice('Bearer '.length).trim()
-        : '';
-      const session = verifySessionToken(token);
+      const { token } = extractTokenFromRequest(req);
+      const session = token ? await verifySessionToken(token) : null;
       const setup = await isSetupRequired();
 
       return res.json({
         authenticated: Boolean(session),
         email: session?.email ?? null,
+        token: session && token ? token : null,
         allowedEmail: getAllowedEmail(),
         setupRequired: setup.setupRequired,
         dbConnected: setup.dbConnected,
@@ -488,6 +489,11 @@ export async function createServerApp(options: { standalone?: boolean } = {}) {
         error: err instanceof Error ? err.message : 'Auth status check failed.',
       });
     }
+  });
+
+  app.post('/api/auth/logout', (req: Request, res: Response) => {
+    clearSessionCookie(req, res);
+    return res.json({ ok: true });
   });
 
   app.post('/api/auth/claim', async (req: Request, res: Response) => {
@@ -538,7 +544,8 @@ export async function createServerApp(options: { standalone?: boolean } = {}) {
         });
       }
 
-      const token = createSessionToken(allowedEmail);
+      const token = await createSessionToken(allowedEmail);
+      setSessionCookie(req, res, token);
       await recordLog('info', 'auth', `Administrator account claimed for ${allowedEmail}.`);
       return res.json({ token, email: allowedEmail });
     } catch (err: unknown) {
@@ -570,7 +577,8 @@ export async function createServerApp(options: { standalone?: boolean } = {}) {
         if (!valid) {
           return res.status(401).json({ error: 'Invalid password.' });
         }
-        const token = createSessionToken(allowedEmail);
+        const token = await createSessionToken(allowedEmail);
+        setSessionCookie(req, res, token);
         const dbReady = await initDatabase();
         if (dbReady.ok) {
           await recordLog('info', 'auth', `Signed in as ${allowedEmail}.`);
@@ -604,7 +612,8 @@ export async function createServerApp(options: { standalone?: boolean } = {}) {
         return res.status(401).json({ error: 'Invalid password.' });
       }
 
-      const token = createSessionToken(allowedEmail);
+      const token = await createSessionToken(allowedEmail);
+      setSessionCookie(req, res, token);
       await recordLog('info', 'auth', `Signed in as ${allowedEmail}.`);
       return res.json({ token, email: allowedEmail });
     } catch (err: unknown) {

@@ -85,6 +85,13 @@ export async function initDatabase(): Promise<{ ok: boolean; error?: string }> {
     `);
 
     await db.query(`
+      CREATE TABLE IF NOT EXISTS app_meta (
+        key TEXT PRIMARY KEY,
+        value TEXT NOT NULL
+      );
+    `);
+
+    await db.query(`
       CREATE TABLE IF NOT EXISTS publisher_settings (
         id INTEGER PRIMARY KEY DEFAULT 1 CHECK (id = 1),
         facebook_page_id TEXT NOT NULL DEFAULT '',

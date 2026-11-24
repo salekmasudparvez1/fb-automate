@@ -52,7 +52,11 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({
       const endpoint = isSetup ? '/api/auth/claim' : '/api/auth/login';
       const res = await fetch(endpoint, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        credentials: 'include',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Requested-With': 'XMLHttpRequest',
+        },
         body: JSON.stringify({
           email: normalizedEmail,
           password,
