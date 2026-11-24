@@ -109,6 +109,64 @@ export async function setFacebookTokenErrorNotice(message: string | null): Promi
   }
 }
 
+export async function markTokenPausedForSha(tokenUsed: string | null): Promise<void> {
+  try {
+    const dbInit = await initDatabase();
+    if (!dbInit.ok) return;
+    const tokenSha = tokenUsed ? sha256(tokenUsed) : '';
+    await getPool().query(
+      `INSERT INTO app_meta (key, value)
+       VALUES ('fb_paused_token_sha', $1)
+       ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`,
+      [tokenSha]
+    );
+  } catch {
+    // ignore
+  }
+}
+
+export async function reconcileEnvTokenRecovery(): Promise<boolean> {
+  try {
+    const dbInit = await initDatabase();
+    if (!dbInit.ok) return false;
+    const pool = getPool();
+    const res = await pool.query<{ key: string; value: string }>(
+      `SELECT key, value FROM app_meta
+       WHERE key IN ('fb_paused_token_sha', 'fb_token_error_notice', 'fb_source_token_sha')`
+    );
+    const map = new Map(res.rows.map((r) => [r.key, r.value]));
+    const pausedSha = (map.get('fb_paused_token_sha') || '').trim();
+    const errorNotice = (map.get('fb_token_error_notice') || '').trim();
+    const { accessToken: envToken } = getEnvFacebookCredentials();
+
+    if (!envToken) return false;
+    const envSha = sha256(envToken);
+
+    // If a pause happened on an older env token and the operator updated FACEBOOK_ACCESS_TOKEN,
+    // automatically clear the expiry notice and re-enable auto_publish_enabled.
+    if (pausedSha && envSha !== pausedSha) {
+      await pool.query(
+        `INSERT INTO app_meta (key, value)
+         VALUES ('fb_token_error_notice', ''), ('fb_paused_token_sha', '')
+         ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`
+      );
+      if (errorNotice || pausedSha) {
+        await pool.query(
+          `UPDATE publisher_settings
+           SET auto_publish_enabled = TRUE,
+               updated_at = NOW()
+           WHERE id = 1`
+        );
+      }
+      return true;
+    }
+
+    return false;
+  } catch {
+    return false;
+  }
+}
+
 export async function getFacebookTokenMetaStatus(): Promise<{
   hasPermanentStoredToken: boolean;
   expiresLabel: string | null;

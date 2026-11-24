@@ -283,7 +283,7 @@ export default function App() {
       if (cancelled || httpSyncTimer !== null) return;
       setSocketConnected(false);
       setSyncMode('http-sync');
-      httpSyncTimer = window.setInterval(async () => {
+      const runPollTick = async () => {
         if (cancelled) return;
         try {
           if (settingsAutoPublishRef.current) {
@@ -296,6 +296,10 @@ export default function App() {
         } catch {
           // Handled by apiFetch
         }
+      };
+      void runPollTick();
+      httpSyncTimer = window.setInterval(() => {
+        void runPollTick();
       }, 15000);
     };
 
@@ -774,6 +778,7 @@ export default function App() {
 
   const handleRunSchedulerNow = async () => {
     await apiFetch('/api/scheduler/run', { method: 'POST' });
+    setTableRefreshKey((n) => n + 1);
     if (!socketConnected) void refreshWorkspaceViaRest();
   };
 

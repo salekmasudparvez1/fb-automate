@@ -56,6 +56,8 @@ import {
   getFacebookAppCredentials,
   getFacebookTokenMetaStatus,
   isFacebookTokenError,
+  markTokenPausedForSha,
+  reconcileEnvTokenRecovery,
   resolveEffectiveEnvFacebookCredentials,
   setFacebookTokenErrorNotice,
 } from './server/fbToken.ts';
@@ -589,6 +591,7 @@ export async function createServerApp(options: { standalone?: boolean } = {}) {
   }
 
   async function loadFullWorkspaceState() {
+    await reconcileEnvTokenRecovery();
     const pool = getPool();
     const [postsRes, settingsRes, logsRes] = await Promise.all([
       pool.query<DbPostRow>(
@@ -744,6 +747,7 @@ export async function createServerApp(options: { standalone?: boolean } = {}) {
 
       const handleTokenExpiryPause = async (expiredMessage: string) => {
         const friendly = `${expiredMessage} Auto-publish paused and posts kept PENDING so your queue does not fail while you are away. Update FACEBOOK_ACCESS_TOKEN in Secrets (or configure FACEBOOK_APP_ID & FACEBOOK_APP_SECRET for a never-expiring Page Token).`;
+        await markTokenPausedForSha(getEnvFacebookCredentials().accessToken || accessToken);
         await setFacebookTokenErrorNotice(friendly);
         const pausedRes = await pool.query<DbSettingsRow>(
           `UPDATE publisher_settings
@@ -875,6 +879,14 @@ export async function createServerApp(options: { standalone?: boolean } = {}) {
     if (!dbReady.ok) return;
 
     try {
+      const tokenRecovered = await reconcileEnvTokenRecovery();
+      if (tokenRecovered) {
+        await recordLog(
+          'success',
+          'facebook',
+          'Detected updated FACEBOOK_ACCESS_TOKEN in server environment — cleared expiry notice and resumed Auto-Publish.'
+        );
+      }
       const pool = getPool();
       const settingsRes = await pool.query<DbSettingsRow>(
         'SELECT * FROM publisher_settings WHERE id = 1 LIMIT 1'
@@ -1780,8 +1792,13 @@ export async function createServerApp(options: { standalone?: boolean } = {}) {
         req.body?.monthKey !== undefined
           ? String(req.body.monthKey).trim() || existing.monthKey
           : existing.monthKey;
+      const scheduleEdited =
+        scheduledAt !== existing.scheduledAt || slotTime !== existing.slotTime;
       const status =
-        req.body?.status === 'PENDING' ? 'PENDING' : existing.status;
+        req.body?.status === 'PENDING' ||
+        (existing.status === 'FAILED' && scheduleEdited)
+          ? 'PENDING'
+          : existing.status;
 
       const updatedRes = await pool.query<DbPostRow>(
         `UPDATE scheduled_posts
@@ -2237,6 +2254,7 @@ Create a fresh angle and stronger hook distinct from: "${post.seoTitle}".`,
 
       if (autoPublishEnabled) {
         await setFacebookTokenErrorNotice('');
+        await markTokenPausedForSha('');
       }
 
       const serialized = await buildSerializedSettings(updatedRes.rows[0]);
@@ -2268,6 +2286,7 @@ Create a fresh angle and stronger hook distinct from: "${post.seoTitle}".`,
       const resolved = await resolveFacebookTarget(pageId, accessToken);
       if (!resolved.ok) {
         if (resolved.tokenExpired) {
+          await markTokenPausedForSha(getEnvFacebookCredentials().accessToken || accessToken);
           await setFacebookTokenErrorNotice(resolved.error);
         }
         return res.status(400).json({
@@ -2278,6 +2297,13 @@ Create a fresh angle and stronger hook distinct from: "${post.seoTitle}".`,
       }
 
       await setFacebookTokenErrorNotice('');
+      await markTokenPausedForSha('');
+      await getPool().query(
+        `UPDATE publisher_settings
+         SET auto_publish_enabled = TRUE,
+             updated_at = NOW()
+         WHERE id = 1 AND auto_publish_enabled = FALSE`
+      );
       const updatedSettings = await buildSerializedSettings(
         (
           await getPool().query<DbSettingsRow>(
@@ -2324,18 +2350,22 @@ Create a fresh angle and stronger hook distinct from: "${post.seoTitle}".`,
         return res.status(400).json({ error: exchanged.error });
       }
 
-      const settingsRow = (
-        await getPool().query<DbSettingsRow>(
-          'SELECT * FROM publisher_settings WHERE id = 1 LIMIT 1'
-        )
-      ).rows[0];
+      await markTokenPausedForSha('');
+      const resumedRes = await getPool().query<DbSettingsRow>(
+        `UPDATE publisher_settings
+         SET auto_publish_enabled = TRUE,
+             updated_at = NOW()
+         WHERE id = 1
+         RETURNING *`
+      );
+      const settingsRow = resumedRes.rows[0];
       const serialized = await buildSerializedSettings(settingsRow);
       broadcast({ type: 'settings:updated', data: serialized });
 
       await recordLog(
         'success',
         'facebook',
-        `Exchanged and stored encrypted permanent Page Access Token for "${exchanged.pageName}".`
+        `Exchanged and stored encrypted permanent Page Access Token for "${exchanged.pageName}" and resumed Auto-Publish.`
       );
 
       return res.json({
@@ -2403,6 +2433,42 @@ Create a fresh angle and stronger hook distinct from: "${post.seoTitle}".`,
       nextRunAt: nextSchedulerRunAt,
     });
   });
+
+  // External / Vercel Cron trigger (protected by CRON_SECRET header) for unattended serverless deployments
+  const handleCronScheduler = async (req: Request, res: Response) => {
+    const expectedSecret = (process.env.CRON_SECRET || '').trim();
+    if (!expectedSecret) {
+      return res.status(503).json({
+        error: 'CRON_SECRET environment variable is not configured on the server.',
+      });
+    }
+
+    const authHeader = String(req.headers.authorization || '');
+    const bearerSecret = authHeader.startsWith('Bearer ')
+      ? authHeader.slice(7).trim()
+      : '';
+    const headerSecret = String(req.headers['x-cron-secret'] || '').trim();
+    const provided = bearerSecret || headerSecret;
+
+    const expectedBuf = Buffer.from(expectedSecret, 'utf8');
+    const providedBuf = Buffer.from(provided, 'utf8');
+    if (
+      providedBuf.length !== expectedBuf.length ||
+      !crypto.timingSafeEqual(providedBuf, expectedBuf)
+    ) {
+      return res.status(401).json({ error: 'Unauthorized cron invocation.' });
+    }
+
+    await runBackgroundScheduler('auto');
+    return res.json({
+      ok: true,
+      lastRunAt: lastSchedulerRunAt,
+      nextRunAt: nextSchedulerRunAt,
+    });
+  };
+
+  app.get('/api/cron/scheduler', handleCronScheduler);
+  app.post('/api/cron/scheduler', handleCronScheduler);
 
   // ---------------- Static / Vite Middleware (Standalone Only) ----------------
 
