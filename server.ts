@@ -464,6 +464,7 @@ export async function createServerApp(options: { standalone?: boolean } = {}) {
     res.json({
       ok: true,
       model: GEMINI_MODEL,
+      realtimeMode: standalone ? 'websocket' : 'http-sync',
       dbConnected: dbCheck.ok,
       dbError: dbCheck.error,
     });
@@ -480,6 +481,7 @@ export async function createServerApp(options: { standalone?: boolean } = {}) {
         email: session?.email ?? null,
         token: session && token ? token : null,
         allowedEmail: getAllowedEmail(),
+        realtimeMode: standalone ? 'websocket' : 'http-sync',
         setupRequired: setup.setupRequired,
         dbConnected: setup.dbConnected,
         dbError: setup.dbError ?? null,
@@ -1250,8 +1252,24 @@ Create a fresh angle and stronger hook distinct from: "${post.seoTitle}".`,
     }
   });
 
-  app.post('/api/scheduler/run', requireAuth, async (_req: AuthenticatedRequest, res: Response) => {
-    await runBackgroundScheduler('manual');
+  app.get('/api/sync', requireAuth, async (_req: AuthenticatedRequest, res: Response) => {
+    try {
+      const dbCheck = await initDatabase();
+      if (!dbCheck.ok) {
+        return res.status(503).json({ error: dbCheck.error });
+      }
+      const state = await loadFullWorkspaceState();
+      return res.json(state);
+    } catch (err: unknown) {
+      return res.status(500).json({
+        error: err instanceof Error ? err.message : 'Failed to sync workspace state.',
+      });
+    }
+  });
+
+  app.post('/api/scheduler/run', requireAuth, async (req: AuthenticatedRequest, res: Response) => {
+    const trigger = req.body?.trigger === 'auto' ? 'auto' : 'manual';
+    await runBackgroundScheduler(trigger);
     return res.json({
       ok: true,
       lastRunAt: lastSchedulerRunAt,

@@ -51,6 +51,9 @@ export default function App() {
   });
 
   const [socketConnected, setSocketConnected] = useState<boolean>(false);
+  const [syncMode, setSyncMode] = useState<
+    'connecting' | 'websocket' | 'http-sync' | 'reconnecting'
+  >('connecting');
   const [isGenerating, setIsGenerating] = useState<boolean>(false);
   const [isApplyingSlots, setIsApplyingSlots] = useState<boolean>(false);
   const [generatorError, setGeneratorError] = useState<string | null>(null);
@@ -60,6 +63,11 @@ export default function App() {
 
   const wsRef = useRef<WebSocket | null>(null);
   const reconnectTimerRef = useRef<number | null>(null);
+  const settingsAutoPublishRef = useRef<boolean>(true);
+
+  useEffect(() => {
+    settingsAutoPublishRef.current = settings.autoPublishEnabled;
+  }, [settings.autoPublishEnabled]);
 
   const fetchAuthStatus = useCallback(async (token?: string | null) => {
     setAuthLoading(true);
@@ -129,23 +137,26 @@ export default function App() {
   const refreshWorkspaceViaRest = useCallback(async () => {
     if (!authToken) return;
     try {
-      const [postsRes, settingsRes, logsRes] = await Promise.all([
-        apiFetch<{ posts: ScheduledPost[] }>('/api/posts'),
-        apiFetch<{ settings: PublisherSettings }>('/api/settings'),
-        apiFetch<{ logs: ActivityLogEntry[] }>('/api/logs'),
-      ]);
-      setPosts(postsRes.posts || []);
-      if (settingsRes.settings) setSettings(settingsRes.settings);
-      setLogs(logsRes.logs || []);
+      const state = await apiFetch<{
+        posts: ScheduledPost[];
+        settings: PublisherSettings;
+        logs: ActivityLogEntry[];
+        scheduler?: SchedulerStatus;
+      }>('/api/sync');
+      setPosts(state.posts || []);
+      if (state.settings) setSettings(state.settings);
+      setLogs(state.logs || []);
+      if (state.scheduler) setScheduler(state.scheduler);
     } catch {
       // Handled by apiFetch on 401
     }
   }, [authToken, apiFetch]);
 
-  // Real-time WebSocket connection & REST initial load when authenticated
+  // Real-time WebSocket on Node servers, automatic HTTP Live Sync on Vercel serverless
   useEffect(() => {
     if (!authToken) {
       setSocketConnected(false);
+      setSyncMode('connecting');
       if (wsRef.current) {
         wsRef.current.close();
         wsRef.current = null;
@@ -155,6 +166,38 @@ export default function App() {
 
     void refreshWorkspaceViaRest();
     let cancelled = false;
+    let httpSyncTimer: number | null = null;
+    let wsFailures = 0;
+
+    const startHttpSyncFallback = () => {
+      if (cancelled || httpSyncTimer !== null) return;
+      setSocketConnected(false);
+      setSyncMode('http-sync');
+      httpSyncTimer = window.setInterval(async () => {
+        if (cancelled) return;
+        try {
+          if (settingsAutoPublishRef.current) {
+            await apiFetch('/api/scheduler/run', {
+              method: 'POST',
+              body: JSON.stringify({ trigger: 'auto' }),
+            });
+          }
+          await refreshWorkspaceViaRest();
+        } catch {
+          // Handled by apiFetch
+        }
+      }, 15000);
+    };
+
+    if (authStatus?.realtimeMode === 'http-sync') {
+      startHttpSyncFallback();
+      return () => {
+        cancelled = true;
+        if (httpSyncTimer !== null) window.clearInterval(httpSyncTimer);
+      };
+    }
+
+    setSyncMode('connecting');
 
     const connect = () => {
       if (cancelled) return;
@@ -183,7 +226,9 @@ export default function App() {
                 logs: ActivityLogEntry[];
                 scheduler: SchedulerStatus;
               };
+              wsFailures = 0;
               setSocketConnected(true);
+              setSyncMode('websocket');
               setPosts(payload.posts || []);
               if (payload.settings) setSettings(payload.settings);
               setLogs(payload.logs || []);
@@ -257,9 +302,14 @@ export default function App() {
 
       ws.onclose = () => {
         setSocketConnected(false);
-        if (!cancelled) {
-          reconnectTimerRef.current = window.setTimeout(connect, 2500);
+        if (cancelled) return;
+        wsFailures += 1;
+        if (wsFailures >= 2) {
+          startHttpSyncFallback();
+          return;
         }
+        setSyncMode('reconnecting');
+        reconnectTimerRef.current = window.setTimeout(connect, 2500);
       };
     };
 
@@ -274,6 +324,9 @@ export default function App() {
     return () => {
       cancelled = true;
       window.clearInterval(pingInterval);
+      if (httpSyncTimer !== null) {
+        window.clearInterval(httpSyncTimer);
+      }
       if (reconnectTimerRef.current) {
         window.clearTimeout(reconnectTimerRef.current);
       }
@@ -282,7 +335,7 @@ export default function App() {
         wsRef.current = null;
       }
     };
-  }, [authToken, refreshWorkspaceViaRest]);
+  }, [authToken, authStatus?.realtimeMode, apiFetch, refreshWorkspaceViaRest]);
 
   const handleAuthenticated = (token: string, email: string) => {
     setAuthToken(token);
@@ -579,21 +632,27 @@ export default function App() {
           </div>
 
           <div className="flex flex-wrap items-center gap-2.5">
-            {/* Real Live WebSocket Connection Status */}
+            {/* Real-Time Sync Status (WebSocket on Node, Live Sync on Vercel) */}
             <div
               className={`inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-lg border whitespace-nowrap ${
-                socketConnected
+                syncMode === 'websocket' || syncMode === 'http-sync'
                   ? 'bg-emerald-50 border-emerald-200 text-emerald-800'
                   : 'bg-amber-50 border-amber-200 text-amber-800'
               }`}
             >
-              {socketConnected ? (
+              {syncMode === 'websocket' || syncMode === 'http-sync' ? (
                 <Wifi className="w-3.5 h-3.5" />
               ) : (
                 <WifiOff className="w-3.5 h-3.5" />
               )}
               <span>
-                {socketConnected ? 'Socket Live' : 'Reconnecting...'}
+                {syncMode === 'websocket'
+                  ? 'Socket Live'
+                  : syncMode === 'http-sync'
+                    ? 'Live Sync Active'
+                    : syncMode === 'connecting'
+                      ? 'Connecting...'
+                      : 'Reconnecting...'}
               </span>
             </div>
 

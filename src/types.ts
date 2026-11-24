@@ -55,6 +55,7 @@ export interface AuthStatus {
   email: string | null;
   token?: string | null;
   allowedEmail: string;
+  realtimeMode?: 'websocket' | 'http-sync';
   setupRequired: boolean;
   dbConnected: boolean;
   dbError: string | null;
