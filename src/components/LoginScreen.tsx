@@ -4,7 +4,14 @@ import type { AuthStatus } from '../types';
 
 interface LoginScreenProps {
   authStatus: AuthStatus;
-  onAuthenticated: (token: string, email: string) => void;
+  onAuthenticated: (payload: {
+    token: string;
+    email: string;
+    expiresAt?: string | null;
+    sid?: string | null;
+    jtiPrefix?: string | null;
+    tokenVersion?: number | null;
+  }) => void;
   onRefreshStatus: () => Promise<void>;
 }
 
@@ -13,7 +20,7 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({
   onAuthenticated,
   onRefreshStatus,
 }) => {
-  const [email, setEmail] = useState(authStatus.allowedEmail);
+  const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [confirmPassword, setConfirmPassword] = useState('');
   const [isSubmitting, setIsSubmitting] = useState(false);
@@ -26,8 +33,8 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({
     setError(null);
 
     const normalizedEmail = email.trim().toLowerCase();
-    if (normalizedEmail !== authStatus.allowedEmail.toLowerCase()) {
-      setError(`Only ${authStatus.allowedEmail} has permission to log in.`);
+    if (!normalizedEmail) {
+      setError('Email is required.');
       return;
     }
 
@@ -66,6 +73,10 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({
       const data = (await res.json().catch(() => ({}))) as {
         token?: string;
         email?: string;
+        expiresAt?: string;
+        sid?: string;
+        jtiPrefix?: string;
+        tokenVersion?: number;
         error?: string;
       };
 
@@ -73,7 +84,14 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({
         throw new Error(data.error || 'Authentication failed.');
       }
 
-      onAuthenticated(data.token, data.email);
+      onAuthenticated({
+        token: data.token,
+        email: data.email,
+        expiresAt: data.expiresAt ?? null,
+        sid: data.sid ?? null,
+        jtiPrefix: data.jtiPrefix ?? null,
+        tokenVersion: data.tokenVersion ?? null,
+      });
     } catch (err: unknown) {
       setError(err instanceof Error ? err.message : 'Authentication failed.');
     } finally {
@@ -82,35 +100,39 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({
   };
 
   return (
-    <div className="min-h-screen bg-slate-50 flex flex-col justify-center items-center px-4 py-12">
-      <div className="w-full max-w-md bg-white border border-slate-200 rounded-xl p-6 sm:p-8">
-        <div className="mb-6">
-          <h1 className="font-display text-2xl font-bold tracking-tight text-slate-900">
-            FB Series Auto-Publisher
-          </h1>
-          <p className="mt-1.5 text-sm text-slate-600">
-            {isSetup
-              ? 'First-run setup: claim your administrator password in PostgreSQL.'
-              : 'Sign in with your authorized administrator account.'}
-          </p>
+    <div className="min-h-screen bg-[#F0F2F5] flex flex-col justify-center items-center px-4 py-10 sm:py-16">
+      <div className="w-full max-w-[440px] bg-white border border-[#E4E6EB] rounded-2xl shadow-sm p-6 sm:p-8">
+        <div className="flex items-center gap-3 mb-6">
+          <div className="w-11 h-11 rounded-full bg-[#1877F2] text-white flex items-center justify-center font-display font-extrabold text-2xl leading-none shrink-0">
+            f
+          </div>
+          <div>
+            <h1 className="font-display text-xl sm:text-2xl font-bold tracking-tight text-[#1C1E21]">
+              FB Page Studio
+            </h1>
+            <p className="text-xs text-[#65676B]">
+              {isSetup
+                ? 'First-run setup: claim your administrator password.'
+                : 'Sign in to manage your automated publishing schedule.'}
+            </p>
+          </div>
         </div>
 
         {!authStatus.dbConnected && (
           <div className="mb-5 p-3.5 bg-amber-50 border border-amber-200 rounded-lg text-xs text-amber-900 space-y-1.5">
             <div className="flex items-center gap-1.5 font-semibold">
               <Database className="w-4 h-4 text-amber-700 shrink-0" />
-              <span>PostgreSQL Connection Required</span>
+              <span>Service Temporarily Unavailable</span>
             </div>
             <p className="leading-relaxed">
-              {authStatus.dbError ||
-                'Set DATABASE_URL in Settings > Secrets so scheduled posts, activity logs, and credentials persist.'}
+              Backend storage is not ready yet. Please try again in a moment.
             </p>
             <button
               type="button"
               onClick={() => void onRefreshStatus()}
               className="text-amber-900 underline font-medium cursor-pointer"
             >
-              Retry Connection Check
+              Retry Connection
             </button>
           </div>
         )}
@@ -119,37 +141,38 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({
           <div>
             <label
               htmlFor="auth-email"
-              className="block text-sm font-medium text-slate-800 mb-1.5"
+              className="block text-sm font-medium text-[#1C1E21] mb-1.5"
             >
-              Authorized Email
+              Email
             </label>
             <div className="relative">
-              <Mail className="w-4 h-4 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2 pointer-events-none" />
+              <Mail className="w-4 h-4 text-[#65676B] absolute left-3 top-1/2 -translate-y-1/2 pointer-events-none" />
               <input
                 id="auth-email"
                 type="email"
+                autoComplete="email"
                 required
                 value={email}
                 onChange={(e) => setEmail(e.target.value)}
-                placeholder={authStatus.allowedEmail}
+                placeholder="name@example.com"
                 disabled={isSubmitting}
-                className="w-full pl-9 pr-3.5 py-2.5 text-sm text-slate-900 bg-white border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-600/20 focus:border-blue-600"
+                className="w-full pl-9 pr-3.5 py-2.5 text-sm text-[#1C1E21] bg-white border border-[#CCD0D5] rounded-lg focus:outline-none focus:ring-2 focus:ring-[#1877F2]/20 focus:border-[#1877F2]"
               />
             </div>
-            <p className="mt-1 text-xs text-slate-500">
-              Restricted to <span className="font-mono">{authStatus.allowedEmail}</span>
+            <p className="mt-1 text-xs text-[#65676B]">
+              Authorized administrator access only.
             </p>
           </div>
 
           <div>
             <label
               htmlFor="auth-password"
-              className="block text-sm font-medium text-slate-800 mb-1.5"
+              className="block text-sm font-medium text-[#1C1E21] mb-1.5"
             >
               {isSetup ? 'Set Administrator Password' : 'Password'}
             </label>
             <div className="relative">
-              <Lock className="w-4 h-4 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2 pointer-events-none" />
+              <Lock className="w-4 h-4 text-[#65676B] absolute left-3 top-1/2 -translate-y-1/2 pointer-events-none" />
               <input
                 id="auth-password"
                 type="password"
@@ -158,7 +181,7 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({
                 onChange={(e) => setPassword(e.target.value)}
                 placeholder={isSetup ? 'Enter administrator password' : 'Enter password'}
                 disabled={isSubmitting}
-                className="w-full pl-9 pr-3.5 py-2.5 text-sm text-slate-900 bg-white border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-600/20 focus:border-blue-600"
+                className="w-full pl-9 pr-3.5 py-2.5 text-sm text-[#1C1E21] bg-white border border-[#CCD0D5] rounded-lg focus:outline-none focus:ring-2 focus:ring-[#1877F2]/20 focus:border-[#1877F2]"
               />
             </div>
           </div>
@@ -167,12 +190,12 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({
             <div>
               <label
                 htmlFor="auth-password-confirm"
-                className="block text-sm font-medium text-slate-800 mb-1.5"
+                className="block text-sm font-medium text-[#1C1E21] mb-1.5"
               >
                 Confirm Password
               </label>
               <div className="relative">
-                <KeyRound className="w-4 h-4 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2 pointer-events-none" />
+                <KeyRound className="w-4 h-4 text-[#65676B] absolute left-3 top-1/2 -translate-y-1/2 pointer-events-none" />
                 <input
                   id="auth-password-confirm"
                   type="password"
@@ -181,7 +204,7 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({
                   onChange={(e) => setConfirmPassword(e.target.value)}
                   placeholder="Re-enter password"
                   disabled={isSubmitting}
-                  className="w-full pl-9 pr-3.5 py-2.5 text-sm text-slate-900 bg-white border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-600/20 focus:border-blue-600"
+                  className="w-full pl-9 pr-3.5 py-2.5 text-sm text-[#1C1E21] bg-white border border-[#CCD0D5] rounded-lg focus:outline-none focus:ring-2 focus:ring-[#1877F2]/20 focus:border-[#1877F2]"
                 />
               </div>
             </div>
@@ -200,7 +223,7 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({
           <button
             type="submit"
             disabled={isSubmitting || (!authStatus.dbConnected && isSetup)}
-            className="w-full py-2.5 px-4 text-sm font-semibold text-white bg-blue-700 hover:bg-blue-800 disabled:bg-blue-400 rounded-lg transition-colors flex items-center justify-center gap-2 cursor-pointer"
+            className="w-full py-2.5 px-4 text-sm font-semibold text-white bg-[#1877F2] hover:bg-[#166FE5] disabled:bg-[#1877F2]/60 rounded-lg transition-colors flex items-center justify-center gap-2 cursor-pointer min-h-[44px]"
           >
             {isSubmitting ? (
               <>

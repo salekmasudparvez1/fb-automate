@@ -50,11 +50,38 @@ export interface ActivityLogEntry {
 
 export type QueueFilter = 'ALL' | 'PENDING' | 'POSTED' | 'FAILED';
 
+export interface AuthSecurityInfo {
+  passwordAlgorithm: string;
+  passwordStoredInDb: boolean;
+  envPasswordOverride: boolean;
+  jwtAlgorithm: string;
+  accessTtlMinutes: number;
+  refreshTtlDays: number;
+  activeSessionsCount?: number;
+  tokenVersion?: number;
+  lastLoginAt?: string | null;
+  passwordUpdatedAt?: string | null;
+}
+
+export interface AuthSessionItem {
+  sid: string;
+  jtiPrefix: string;
+  userAgent: string;
+  ipAddress: string;
+  createdAt: string;
+  lastUsedAt: string;
+  expiresAt: string;
+  isCurrent: boolean;
+}
+
 export interface AuthStatus {
   authenticated: boolean;
   email: string | null;
   token?: string | null;
-  allowedEmail: string;
+  expiresAt?: string | null;
+  sid?: string | null;
+  jtiPrefix?: string | null;
+  tokenVersion?: number | null;
   realtimeMode?: 'websocket' | 'http-sync';
   setupRequired: boolean;
   dbConnected: boolean;

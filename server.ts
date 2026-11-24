@@ -16,21 +16,39 @@ import {
   serializePost,
   serializeSettings,
   type DbActivityLogRow,
+  type DbAuthRow,
+  type DbAuthSessionRow,
   type DbPostRow,
   type DbSettingsRow,
 } from './server/db.ts';
 import {
-  clearSessionCookie,
-  createSessionToken,
-  extractTokenFromRequest,
-  getAllowedEmail,
-  hashPassword,
+  checkAuthRateLimit,
+  clearFailedAuthAttempts,
+  clearRefreshCookie,
+  ensureEnvPasswordSyncedInDb,
+  extractBearerToken,
+  extractVerifiedRefreshCookie,
+  getAccessTokenTtlSec,
+  getBcryptCost,
+  getEnvAdminEmail,
+  getRefreshTokenTtlMs,
+  hashPasswordBcrypt,
+  isEnvPasswordConfigured,
   isSetupRequired,
+  issueSessionAndTokens,
+  passesCookieCsrfCheck,
+  recordFailedAuthAttempt,
   requireAuth,
-  setSessionCookie,
+  resolveAuthorizedEmail,
+  revokeAllSessionsForEmail,
+  revokeSessionById,
+  revokeSessionByRefreshToken,
+  rotateManagedSigningSecrets,
+  rotateRefreshSession,
+  setRefreshCookie,
+  verifyAccessJwt,
+  verifyPasswordHash,
   verifyPlaintextConstantTime,
-  verifyScryptPassword,
-  verifySessionToken,
   type AuthenticatedRequest,
 } from './server/auth.ts';
 import { buildMl30DayCurriculumPosts } from './server/mlCurriculum.ts';
@@ -274,6 +292,69 @@ let lastSchedulerRunAt: string | null = null;
 export async function createServerApp(options: { standalone?: boolean } = {}) {
   const standalone = options.standalone ?? false;
   const app = express();
+  app.set('trust proxy', 1);
+  app.disable('x-powered-by');
+
+  const allowedCorsOrigins = new Set<string>();
+  const rawCorsOrigins = (process.env.CORS_ORIGIN || '').split(',');
+  for (const item of rawCorsOrigins) {
+    const trimmed = item.trim().replace(/\/+$/, '');
+    if (trimmed) allowedCorsOrigins.add(trimmed);
+  }
+  if (process.env.APP_URL) {
+    try {
+      allowedCorsOrigins.add(new URL(process.env.APP_URL).origin);
+    } catch {
+      // ignore invalid APP_URL
+    }
+  }
+
+  // Security headers + strict CORS enforcement (no wildcard on authenticated endpoints)
+  app.use((req, res, next) => {
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
+    res.setHeader('Permissions-Policy', 'camera=(), microphone=(), geolocation=()');
+
+    const originHeader = req.headers.origin;
+    if (originHeader) {
+      const normalizedOrigin = originHeader.trim().replace(/\/+$/, '');
+      const requestHost = (req.headers['x-forwarded-host'] || req.headers.host || '')
+        .toString()
+        .split(',')[0]
+        .trim()
+        .toLowerCase();
+      let isSameHost = false;
+      try {
+        isSameHost = new URL(normalizedOrigin).host.toLowerCase() === requestHost;
+      } catch {
+        isSameHost = false;
+      }
+
+      if (allowedCorsOrigins.has(normalizedOrigin) || isSameHost) {
+        res.setHeader('Access-Control-Allow-Origin', normalizedOrigin);
+        res.setHeader('Vary', 'Origin');
+        res.setHeader('Access-Control-Allow-Credentials', 'true');
+        res.setHeader(
+          'Access-Control-Allow-Headers',
+          'Content-Type, Authorization, X-Requested-With'
+        );
+        res.setHeader(
+          'Access-Control-Allow-Methods',
+          'GET, POST, PUT, PATCH, DELETE, OPTIONS'
+        );
+      } else if (req.path.startsWith('/api/')) {
+        res.status(403).json({ error: 'CORS origin not allowed.' });
+        return;
+      }
+    }
+
+    if (req.method === 'OPTIONS') {
+      res.status(204).end();
+      return;
+    }
+    next();
+  });
+
   app.use(express.json({ limit: '2mb' }));
 
   const server = standalone ? http.createServer(app) : null;
@@ -491,9 +572,9 @@ export async function createServerApp(options: { standalone?: boolean } = {}) {
         try {
           const msg = JSON.parse(raw.toString()) as { type?: string; token?: string };
           if (msg.type === 'auth') {
-            const payload = await verifySessionToken(String(msg.token ?? ''));
+            const payload = await verifyAccessJwt(String(msg.token ?? ''));
             if (!payload) {
-              ws.send(JSON.stringify({ type: 'auth:error', error: 'Invalid session token' }));
+              ws.send(JSON.stringify({ type: 'auth:error', error: 'Invalid or expired JWT' }));
               ws.close(4001, 'Unauthorized');
               return;
             }
@@ -800,19 +881,52 @@ export async function createServerApp(options: { standalone?: boolean } = {}) {
 
   app.get('/api/auth/status', async (req: Request, res: Response) => {
     try {
-      const { token } = extractTokenFromRequest(req);
-      const session = token ? await verifySessionToken(token) : null;
       const setup = await isSetupRequired();
+      const bearerToken = extractBearerToken(req);
+      let session = bearerToken ? await verifyAccessJwt(bearerToken) : null;
+      let activeToken: string | null = session && bearerToken ? bearerToken : null;
+
+      // If no active Bearer JWT was sent, transparently rotate from HMAC-signed HttpOnly refresh cookie
+      if (!session && setup.dbConnected) {
+        const refreshToken = await extractVerifiedRefreshCookie(req);
+        if (refreshToken) {
+          const rotated = await rotateRefreshSession(refreshToken, req);
+          if (rotated.ok) {
+            await setRefreshCookie(req, res, rotated.refreshToken);
+            activeToken = rotated.accessToken;
+            session = {
+              email: rotated.email,
+              sid: rotated.sid,
+              jti: rotated.jti,
+              tokenVersion: rotated.tokenVersion,
+              expiresAt: rotated.expiresAt,
+              issuedAt: new Date().toISOString(),
+            };
+          } else {
+            if (rotated.reuseDetected) {
+              await recordLog(
+                'warning',
+                'auth',
+                'Security alert: refresh token reuse detected. Session family revoked.'
+              );
+            }
+            clearRefreshCookie(req, res);
+          }
+        }
+      }
 
       return res.json({
         authenticated: Boolean(session),
         email: session?.email ?? null,
-        token: session && token ? token : null,
-        allowedEmail: getAllowedEmail(),
+        token: activeToken,
+        expiresAt: session?.expiresAt ?? null,
+        sid: session?.sid ?? null,
+        jtiPrefix: session?.jti ? session.jti.slice(0, 8) : null,
+        tokenVersion: session?.tokenVersion ?? null,
         realtimeMode: standalone ? 'websocket' : 'http-sync',
         setupRequired: setup.setupRequired,
         dbConnected: setup.dbConnected,
-        dbError: setup.dbError ?? null,
+        dbError: setup.dbConnected ? null : 'Service unavailable.',
       });
     } catch (err: unknown) {
       return res.status(500).json({
@@ -821,20 +935,97 @@ export async function createServerApp(options: { standalone?: boolean } = {}) {
     }
   });
 
-  app.post('/api/auth/logout', (req: Request, res: Response) => {
-    clearSessionCookie(req, res);
+  app.post('/api/auth/refresh', async (req: Request, res: Response) => {
+    try {
+      if (!passesCookieCsrfCheck(req)) {
+        return res.status(403).json({ error: 'Cross-origin refresh request rejected.' });
+      }
+      const rateLimit = await checkAuthRateLimit(req);
+      if (rateLimit.limited) {
+        return res.status(429).json({
+          error: `Too many requests. Try again in ${rateLimit.retryAfterSec}s.`,
+          retryAfterSec: rateLimit.retryAfterSec,
+        });
+      }
+
+      const refreshToken = await extractVerifiedRefreshCookie(req);
+      if (!refreshToken) {
+        return res.status(401).json({ error: 'Refresh session missing. Please sign in again.' });
+      }
+
+      const rotated = await rotateRefreshSession(refreshToken, req);
+      if (!rotated.ok) {
+        clearRefreshCookie(req, res);
+        await recordFailedAuthAttempt(req);
+        if (rotated.reuseDetected) {
+          await recordLog(
+            'warning',
+            'auth',
+            'Security alert: refresh token reuse detected. Session family revoked.'
+          );
+        }
+        return res.status(401).json({ error: rotated.reason });
+      }
+
+      await setRefreshCookie(req, res, rotated.refreshToken);
+      return res.json({
+        token: rotated.accessToken,
+        email: rotated.email,
+        expiresAt: rotated.expiresAt,
+        sid: rotated.sid,
+        jtiPrefix: rotated.jti.slice(0, 8),
+        tokenVersion: rotated.tokenVersion,
+      });
+    } catch (err: unknown) {
+      return res.status(500).json({
+        error: err instanceof Error ? err.message : 'Failed to refresh session.',
+      });
+    }
+  });
+
+  app.post('/api/auth/logout', async (req: Request, res: Response) => {
+    const refreshToken = await extractVerifiedRefreshCookie(req);
+    const bearer = extractBearerToken(req);
+
+    if (refreshToken && !passesCookieCsrfCheck(req)) {
+      return res.status(403).json({ error: 'Cross-origin logout request rejected.' });
+    }
+
+    if (refreshToken) {
+      await revokeSessionByRefreshToken(refreshToken, 'user_logout');
+    }
+    if (bearer) {
+      const session = await verifyAccessJwt(bearer);
+      if (session) {
+        await revokeSessionById(session.sid, session.email, 'user_logout');
+      }
+    }
+
+    clearRefreshCookie(req, res);
     return res.json({ ok: true });
   });
 
   app.post('/api/auth/claim', async (req: Request, res: Response) => {
     try {
+      const rateLimit = await checkAuthRateLimit(req);
+      if (rateLimit.limited) {
+        return res.status(429).json({
+          error: `Too many setup attempts. Try again in ${rateLimit.retryAfterSec}s.`,
+          retryAfterSec: rateLimit.retryAfterSec,
+        });
+      }
+
       const email = String(req.body?.email ?? '').trim().toLowerCase();
       const password = String(req.body?.password ?? '');
-      const allowedEmail = getAllowedEmail();
+      const envAdminEmail = getEnvAdminEmail();
 
-      if (email !== allowedEmail) {
+      if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+        return res.status(400).json({ error: 'Valid email address is required.' });
+      }
+      if (envAdminEmail && email !== envAdminEmail) {
+        await recordFailedAuthAttempt(req);
         return res.status(403).json({
-          error: `Access denied. Only ${allowedEmail} is authorized.`,
+          error: 'This email is not authorized for administrator setup.',
         });
       }
       if (password.length < 8) {
@@ -843,41 +1034,61 @@ export async function createServerApp(options: { standalone?: boolean } = {}) {
           .json({ error: 'Password must be at least 8 characters long.' });
       }
 
-      if (process.env.ADMIN_PASSWORD && process.env.ADMIN_PASSWORD.trim().length > 0) {
+      const envPassword = process.env.ADMIN_PASSWORD?.trim();
+      if (envPassword && envPassword.length > 0 && envAdminEmail) {
         return res.status(409).json({
-          error: 'Admin password is already configured via environment secrets.',
+          error: 'Admin credentials are already configured via environment secrets.',
+        });
+      }
+      if (envPassword && envPassword.length > 0 && !verifyPlaintextConstantTime(password, envPassword)) {
+        await recordFailedAuthAttempt(req);
+        return res.status(403).json({
+          error: 'Password must match the configured environment administrator password.',
         });
       }
 
       const dbCheck = await initDatabase();
       if (!dbCheck.ok) {
         return res.status(503).json({
-          error:
-            dbCheck.error ||
-            'Database is not connected. Configure DATABASE_URL in Settings > Secrets.',
+          error: 'Service temporarily unavailable. Please try again later.',
         });
       }
 
       const pool = getPool();
-      const passwordHash = hashPassword(password);
-      const insertRes = await pool.query<{ email: string }>(
-        `INSERT INTO app_auth (email, password_hash)
-         VALUES ($1, $2)
-         ON CONFLICT (email) DO NOTHING
-         RETURNING email`,
-        [allowedEmail, passwordHash]
+      const passwordHash = await hashPasswordBcrypt(password);
+      // Atomic single-administrator claim: succeeds only when app_auth has zero existing rows
+      const insertRes = await pool.query<DbAuthRow>(
+        `INSERT INTO app_auth (email, password_hash, token_version, password_updated_at)
+         SELECT $1, $2, 1, NOW()
+         WHERE NOT EXISTS (SELECT 1 FROM app_auth)
+         RETURNING *`,
+        [email, passwordHash]
       );
 
       if (insertRes.rowCount === 0) {
         return res.status(409).json({
-          error: 'Administrator password has already been claimed. Please sign in.',
+          error: 'Administrator account has already been claimed. Please sign in.',
         });
       }
 
-      const token = await createSessionToken(allowedEmail);
-      setSessionCookie(req, res, token);
-      await recordLog('info', 'auth', `Administrator account claimed for ${allowedEmail}.`);
-      return res.json({ token, email: allowedEmail });
+      const authRow = insertRes.rows[0];
+      await clearFailedAuthAttempts(req, email);
+      const issued = await issueSessionAndTokens({
+        email,
+        tokenVersion: Number(authRow.token_version || 1),
+        req,
+      });
+
+      await setRefreshCookie(req, res, issued.refreshToken);
+      await recordLog('success', 'auth', 'Administrator account claimed.');
+      return res.json({
+        token: issued.accessToken,
+        email,
+        expiresAt: issued.expiresAt,
+        sid: issued.sid,
+        jtiPrefix: issued.jti.slice(0, 8),
+        tokenVersion: issued.tokenVersion,
+      });
     } catch (err: unknown) {
       return res.status(500).json({
         error: err instanceof Error ? err.message : 'Failed to claim admin account.',
@@ -889,66 +1100,334 @@ export async function createServerApp(options: { standalone?: boolean } = {}) {
     try {
       const email = String(req.body?.email ?? '').trim().toLowerCase();
       const password = String(req.body?.password ?? '');
-      const allowedEmail = getAllowedEmail();
 
       if (!email || !password) {
         return res.status(400).json({ error: 'Email and password are required.' });
       }
 
-      if (email !== allowedEmail) {
-        return res.status(403).json({
-          error: `Permission denied. Only ${allowedEmail} can log in.`,
+      const authorizedEmail = await resolveAuthorizedEmail();
+      const rateLimit = await checkAuthRateLimit(req, authorizedEmail);
+      if (rateLimit.limited) {
+        return res.status(429).json({
+          error: `Too many failed sign-in attempts. Try again in ${rateLimit.retryAfterSec}s.`,
+          retryAfterSec: rateLimit.retryAfterSec,
         });
-      }
-
-      const envPassword = process.env.ADMIN_PASSWORD?.trim();
-      if (envPassword && envPassword.length > 0) {
-        const valid = verifyPlaintextConstantTime(password, envPassword);
-        if (!valid) {
-          return res.status(401).json({ error: 'Invalid password.' });
-        }
-        const token = await createSessionToken(allowedEmail);
-        setSessionCookie(req, res, token);
-        const dbReady = await initDatabase();
-        if (dbReady.ok) {
-          await recordLog('info', 'auth', `Signed in as ${allowedEmail}.`);
-        }
-        return res.json({ token, email: allowedEmail });
       }
 
       const dbCheck = await initDatabase();
       if (!dbCheck.ok) {
         return res.status(503).json({
-          error:
-            dbCheck.error ||
-            'Database is not connected. Configure DATABASE_URL in Settings > Secrets.',
+          error: 'Service temporarily unavailable. Please try again later.',
         });
       }
 
-      const pool = getPool();
-      const userRes = await pool.query<{ email: string; password_hash: string }>(
-        'SELECT email, password_hash FROM app_auth WHERE email = $1 LIMIT 1',
-        [allowedEmail]
-      );
-
-      if (userRes.rowCount === 0) {
+      if (!authorizedEmail) {
         return res.status(409).json({
-          error: 'Admin password has not been claimed yet. Complete first-run setup.',
+          error: 'Administrator account has not been set up yet.',
         });
       }
 
-      const valid = verifyScryptPassword(password, userRes.rows[0].password_hash);
-      if (!valid) {
-        return res.status(401).json({ error: 'Invalid password.' });
+      if (email !== authorizedEmail) {
+        const failState = await recordFailedAuthAttempt(req, authorizedEmail);
+        return res.status(401).json({
+          error: failState.lockedNow
+            ? 'Invalid email or password. Account temporarily locked.'
+            : 'Invalid email or password.',
+        });
       }
 
-      const token = await createSessionToken(allowedEmail);
-      setSessionCookie(req, res, token);
-      await recordLog('info', 'auth', `Signed in as ${allowedEmail}.`);
-      return res.json({ token, email: allowedEmail });
+      const envPassword = process.env.ADMIN_PASSWORD?.trim();
+      let tokenVersion = 1;
+
+      if (envPassword && envPassword.length > 0) {
+        const syncedRow = await ensureEnvPasswordSyncedInDb(authorizedEmail, envPassword);
+        const valid = verifyPlaintextConstantTime(password, envPassword);
+        if (!valid) {
+          const failState = await recordFailedAuthAttempt(req, authorizedEmail);
+          await recordLog(
+            'warning',
+            'auth',
+            'Failed login attempt.',
+            failState.lockedNow ? 'Rate limit lockout triggered.' : undefined
+          );
+          return res.status(401).json({
+            error: failState.lockedNow
+              ? 'Invalid email or password. Account temporarily locked.'
+              : 'Invalid email or password.',
+          });
+        }
+        tokenVersion = Number(syncedRow.token_version || 1);
+      } else {
+        const pool = getPool();
+        const userRes = await pool.query<DbAuthRow>(
+          'SELECT * FROM app_auth WHERE email = $1 LIMIT 1',
+          [authorizedEmail]
+        );
+
+        if (userRes.rowCount === 0) {
+          return res.status(409).json({
+            error: 'Admin password has not been claimed yet. Complete first-run setup.',
+          });
+        }
+
+        const userRow = userRes.rows[0];
+        const check = await verifyPasswordHash(password, userRow.password_hash);
+        if (!check.valid) {
+          const failState = await recordFailedAuthAttempt(req, authorizedEmail);
+          await recordLog(
+            'warning',
+            'auth',
+            'Failed login attempt.',
+            failState.lockedNow ? 'Rate limit lockout triggered.' : undefined
+          );
+          return res.status(401).json({
+            error: failState.lockedNow
+              ? 'Invalid email or password. Account temporarily locked.'
+              : 'Invalid email or password.',
+          });
+        }
+
+        if (check.needsRehash) {
+          const upgradedHash = await hashPasswordBcrypt(password);
+          await pool.query(
+            `UPDATE app_auth
+             SET password_hash = $2, password_updated_at = NOW()
+             WHERE email = $1`,
+            [authorizedEmail, upgradedHash]
+          );
+        }
+
+        tokenVersion = Number(userRow.token_version || 1);
+      }
+
+      await clearFailedAuthAttempts(req, authorizedEmail);
+      const issued = await issueSessionAndTokens({
+        email: authorizedEmail,
+        tokenVersion,
+        req,
+      });
+
+      await setRefreshCookie(req, res, issued.refreshToken);
+      await recordLog(
+        'success',
+        'auth',
+        `Signed in (session token ${issued.jti.slice(0, 8)}).`
+      );
+      return res.json({
+        token: issued.accessToken,
+        email: authorizedEmail,
+        expiresAt: issued.expiresAt,
+        sid: issued.sid,
+        jtiPrefix: issued.jti.slice(0, 8),
+        tokenVersion: issued.tokenVersion,
+      });
     } catch (err: unknown) {
       return res.status(500).json({
         error: err instanceof Error ? err.message : 'Login failed.',
+      });
+    }
+  });
+
+  app.get('/api/auth/sessions', requireAuth, async (req: AuthenticatedRequest, res: Response) => {
+    try {
+      const dbCheck = await initDatabase();
+      if (!dbCheck.ok) {
+        return res.status(503).json({ error: dbCheck.error });
+      }
+      const pool = getPool();
+      const [sessionsRes, authRes] = await Promise.all([
+        pool.query<DbAuthSessionRow>(
+          `SELECT sid, email, jti, token_family, user_agent, ip_address, expires_at, revoked_at, last_used_at, created_at
+           FROM auth_sessions
+           WHERE email = $1 AND revoked_at IS NULL AND expires_at > NOW()
+           ORDER BY last_used_at DESC
+           LIMIT 25`,
+          [req.userEmail]
+        ),
+        pool.query<DbAuthRow>(
+          `SELECT email, token_version, last_login_at, password_updated_at, created_at
+           FROM app_auth
+           WHERE email = $1 LIMIT 1`,
+          [req.userEmail]
+        ),
+      ]);
+
+      const authRow = authRes.rows[0];
+      return res.json({
+        sessions: sessionsRes.rows.map((s) => ({
+          sid: s.sid,
+          jtiPrefix: s.jti.slice(0, 8),
+          userAgent: s.user_agent || 'Unknown client',
+          ipAddress: s.ip_address || 'Unknown',
+          createdAt:
+            s.created_at instanceof Date ? s.created_at.toISOString() : String(s.created_at),
+          lastUsedAt:
+            s.last_used_at instanceof Date
+              ? s.last_used_at.toISOString()
+              : String(s.last_used_at),
+          expiresAt:
+            s.expires_at instanceof Date ? s.expires_at.toISOString() : String(s.expires_at),
+          isCurrent: s.sid === req.sessionId,
+        })),
+        security: {
+          passwordAlgorithm: `cost-${getBcryptCost()}`,
+          passwordStoredInDb: Boolean(authRow),
+          envPasswordOverride: isEnvPasswordConfigured(),
+          jwtAlgorithm: 'HS256',
+          accessTtlMinutes: Math.max(1, Math.round(getAccessTokenTtlSec() / 60)),
+          refreshTtlDays: Math.max(1, Math.round(getRefreshTokenTtlMs() / 86_400_000)),
+          tokenVersion: authRow ? Number(authRow.token_version) : 1,
+          lastLoginAt: authRow?.last_login_at
+            ? new Date(authRow.last_login_at).toISOString()
+            : null,
+          passwordUpdatedAt: authRow?.password_updated_at
+            ? new Date(authRow.password_updated_at).toISOString()
+            : null,
+        },
+      });
+    } catch (err: unknown) {
+      return res.status(500).json({
+        error: err instanceof Error ? err.message : 'Failed to list active sessions.',
+      });
+    }
+  });
+
+  app.delete('/api/auth/sessions/:sid', requireAuth, async (req: AuthenticatedRequest, res: Response) => {
+    try {
+      const sid = String(req.params.sid || '').trim();
+      if (!sid) {
+        return res.status(400).json({ error: 'Session ID is required.' });
+      }
+      const revoked = await revokeSessionById(sid, req.userEmail!, 'admin_revoked');
+      if (!revoked) {
+        return res.status(404).json({ error: 'Active session not found.' });
+      }
+      await recordLog('warning', 'auth', `Revoked active session ${sid.slice(0, 13)}...`);
+      return res.json({ ok: true, revokedCurrent: sid === req.sessionId });
+    } catch (err: unknown) {
+      return res.status(500).json({
+        error: err instanceof Error ? err.message : 'Failed to revoke session.',
+      });
+    }
+  });
+
+  app.post('/api/auth/revoke-all', requireAuth, async (req: AuthenticatedRequest, res: Response) => {
+    try {
+      const includeCurrent = Boolean(req.body?.includeCurrent);
+      const count = await revokeAllSessionsForEmail({
+        email: req.userEmail!,
+        exceptSid: includeCurrent ? undefined : req.sessionId,
+        bumpTokenVersion: includeCurrent,
+        reason: includeCurrent ? 'emergency_revoke_all' : 'revoke_other_sessions',
+      });
+
+      let rotatedKey = false;
+      if (includeCurrent) {
+        rotatedKey = await rotateManagedSigningSecrets().catch(() => false);
+        clearRefreshCookie(req, res);
+      }
+
+      await recordLog(
+        'warning',
+        'auth',
+        includeCurrent
+          ? `Revoked ALL ${count} sessions${rotatedKey ? ' and rotated managed signing keys' : ''}.`
+          : `Revoked ${count} other active session${count === 1 ? '' : 's'}.`
+      );
+      return res.json({ ok: true, revokedCount: count, signedOutCurrent: includeCurrent });
+    } catch (err: unknown) {
+      return res.status(500).json({
+        error: err instanceof Error ? err.message : 'Failed to revoke sessions.',
+      });
+    }
+  });
+
+  app.post('/api/auth/change-password', requireAuth, async (req: AuthenticatedRequest, res: Response) => {
+    try {
+      if (isEnvPasswordConfigured()) {
+        return res.status(409).json({
+          error:
+            'Administrator password is managed by server environment configuration.',
+        });
+      }
+
+      const currentPassword = String(req.body?.currentPassword ?? '');
+      const newPassword = String(req.body?.newPassword ?? '');
+
+      if (!currentPassword || !newPassword) {
+        return res
+          .status(400)
+          .json({ error: 'Current password and new password are required.' });
+      }
+      if (newPassword.length < 8) {
+        return res
+          .status(400)
+          .json({ error: 'New password must be at least 8 characters long.' });
+      }
+      if (newPassword === currentPassword) {
+        return res
+          .status(400)
+          .json({ error: 'New password must differ from current password.' });
+      }
+
+      const pool = getPool();
+      const userRes = await pool.query<DbAuthRow>(
+        'SELECT * FROM app_auth WHERE email = $1 LIMIT 1',
+        [req.userEmail]
+      );
+      const userRow = userRes.rows[0];
+      if (!userRow) {
+        return res.status(404).json({ error: 'Admin account record not found.' });
+      }
+
+      const check = await verifyPasswordHash(currentPassword, userRow.password_hash);
+      if (!check.valid) {
+        return res.status(401).json({ error: 'Current password is incorrect.' });
+      }
+
+      const nextHash = await hashPasswordBcrypt(newPassword);
+      const updateRes = await pool.query<DbAuthRow>(
+        `UPDATE app_auth
+         SET password_hash = $2,
+             token_version = token_version + 1,
+             password_updated_at = NOW()
+         WHERE email = $1
+         RETURNING *`,
+        [req.userEmail, nextHash]
+      );
+
+      const nextVersion = Number(updateRes.rows[0]?.token_version || 2);
+      await revokeAllSessionsForEmail({
+        email: req.userEmail!,
+        bumpTokenVersion: false,
+        reason: 'password_changed',
+      });
+
+      const issued = await issueSessionAndTokens({
+        email: req.userEmail!,
+        tokenVersion: nextVersion,
+        req,
+      });
+
+      await setRefreshCookie(req, res, issued.refreshToken);
+      await recordLog(
+        'success',
+        'auth',
+        `Admin password updated; token revision bumped to v${nextVersion} and previous sessions revoked.`
+      );
+
+      return res.json({
+        ok: true,
+        token: issued.accessToken,
+        email: req.userEmail,
+        expiresAt: issued.expiresAt,
+        sid: issued.sid,
+        jtiPrefix: issued.jti.slice(0, 8),
+        tokenVersion: issued.tokenVersion,
+      });
+    } catch (err: unknown) {
+      return res.status(500).json({
+        error: err instanceof Error ? err.message : 'Failed to change password.',
       });
     }
   });

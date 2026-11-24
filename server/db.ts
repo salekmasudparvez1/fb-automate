@@ -1,5 +1,31 @@
 import { Pool } from 'pg';
 
+export interface DbAuthRow {
+  email: string;
+  password_hash: string;
+  token_version: number;
+  failed_attempts: number;
+  locked_until: Date | string | null;
+  last_login_at: Date | string | null;
+  password_updated_at: Date | string;
+  created_at: Date | string;
+}
+
+export interface DbAuthSessionRow {
+  sid: string;
+  email: string;
+  jti: string;
+  token_family: string;
+  refresh_token_hash: string;
+  user_agent: string;
+  ip_address: string;
+  expires_at: Date | string;
+  revoked_at: Date | string | null;
+  revoked_reason: string | null;
+  last_used_at: Date | string;
+  created_at: Date | string;
+}
+
 export interface DbPostRow {
   id: string;
   month_key: string;
@@ -80,8 +106,53 @@ export async function initDatabase(): Promise<{ ok: boolean; error?: string }> {
       CREATE TABLE IF NOT EXISTS app_auth (
         email TEXT PRIMARY KEY,
         password_hash TEXT NOT NULL,
+        token_version INTEGER NOT NULL DEFAULT 1,
+        failed_attempts INTEGER NOT NULL DEFAULT 0,
+        locked_until TIMESTAMPTZ,
+        last_login_at TIMESTAMPTZ,
+        password_updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
         created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
       );
+    `);
+
+    await db.query(`
+      ALTER TABLE app_auth ADD COLUMN IF NOT EXISTS token_version INTEGER NOT NULL DEFAULT 1;
+      ALTER TABLE app_auth ADD COLUMN IF NOT EXISTS failed_attempts INTEGER NOT NULL DEFAULT 0;
+      ALTER TABLE app_auth ADD COLUMN IF NOT EXISTS locked_until TIMESTAMPTZ;
+      ALTER TABLE app_auth ADD COLUMN IF NOT EXISTS last_login_at TIMESTAMPTZ;
+      ALTER TABLE app_auth ADD COLUMN IF NOT EXISTS password_updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
+    `);
+
+    await db.query(`
+      CREATE TABLE IF NOT EXISTS auth_sessions (
+        sid TEXT PRIMARY KEY,
+        email TEXT NOT NULL,
+        jti TEXT NOT NULL,
+        token_family TEXT NOT NULL,
+        refresh_token_hash TEXT NOT NULL,
+        user_agent TEXT NOT NULL DEFAULT '',
+        ip_address TEXT NOT NULL DEFAULT '',
+        expires_at TIMESTAMPTZ NOT NULL,
+        revoked_at TIMESTAMPTZ,
+        revoked_reason TEXT,
+        last_used_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+    `);
+
+    await db.query(`
+      CREATE INDEX IF NOT EXISTS idx_auth_sessions_email_active
+      ON auth_sessions (email, revoked_at, expires_at);
+    `);
+
+    await db.query(`
+      CREATE INDEX IF NOT EXISTS idx_auth_sessions_refresh_hash
+      ON auth_sessions (refresh_token_hash);
+    `);
+
+    await db.query(`
+      CREATE INDEX IF NOT EXISTS idx_auth_sessions_family
+      ON auth_sessions (token_family);
     `);
 
     await db.query(`
