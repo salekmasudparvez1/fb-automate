@@ -18,7 +18,9 @@ export interface FacebookVerifyResult {
   pageLink: string;
   isPublished: boolean;
   isPageToken: boolean;
+  resolvedViaAccounts?: boolean;
   tokenOwnerName: string | null;
+  availablePages?: Array<{ id: string; name: string }>;
   warnings: string[];
 }
 
@@ -203,9 +205,21 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
               <div className="text-[11px]">
                 Token Type:{' '}
                 <span className="font-mono font-semibold">
-                  {verifyResult.isPageToken ? 'Valid Page Token' : 'User Token (Check Warning)'}
+                  {verifyResult.resolvedViaAccounts
+                    ? 'User Token (Auto-exchanging to Page Token)'
+                    : verifyResult.isPageToken
+                      ? 'Valid Page Token'
+                      : 'User Token (Check Warning)'}
                 </span>
               </div>
+              {verifyResult.availablePages && verifyResult.availablePages.length > 0 && (
+                <div className="text-[11px] text-slate-700">
+                  Accessible Pages:{' '}
+                  {verifyResult.availablePages
+                    .map((p) => `${p.name} (${p.id})`)
+                    .join(', ')}
+                </div>
+              )}
               {verifyResult.warnings.map((w, i) => (
                 <div key={i} className="text-[11px] text-amber-800">
                   • {w}

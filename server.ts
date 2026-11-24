@@ -102,6 +102,171 @@ interface AuthedSocket extends WebSocket {
   userEmail?: string;
 }
 
+type ResolvedFacebookTarget =
+  | {
+      ok: true;
+      effectivePageId: string;
+      effectiveToken: string;
+      pageName: string;
+      pageLink: string;
+      isPublished: boolean;
+      isPageToken: boolean;
+      resolvedViaAccounts: boolean;
+      tokenOwnerId: string;
+      tokenOwnerName: string | null;
+      availablePages: Array<{ id: string; name: string }>;
+      warnings: string[];
+    }
+  | {
+      ok: false;
+      error: string;
+      availablePages?: Array<{ id: string; name: string }>;
+    };
+
+async function resolveFacebookTarget(
+  configuredPageId: string,
+  configuredToken: string
+): Promise<ResolvedFacebookTarget> {
+  const meRes = await fetch(
+    `https://graph.facebook.com/v27.0/me?fields=id,name&access_token=${encodeURIComponent(configuredToken)}`
+  );
+  const meJson = (await meRes.json().catch(() => ({}))) as {
+    id?: string;
+    name?: string;
+    error?: { message?: string };
+  };
+
+  if (!meRes.ok || meJson.error || !meJson.id) {
+    return {
+      ok: false,
+      error:
+        meJson.error?.message ||
+        `Invalid FACEBOOK_ACCESS_TOKEN (HTTP ${meRes.status}).`,
+    };
+  }
+
+  // Probe /me/accounts to detect whether configuredToken is a User Token or Page Token
+  const accountsRes = await fetch(
+    `https://graph.facebook.com/v27.0/me/accounts?fields=id,name,access_token,link,is_published&limit=50&access_token=${encodeURIComponent(configuredToken)}`
+  );
+  const accountsJson = (await accountsRes.json().catch(() => ({}))) as {
+    data?: Array<{
+      id: string;
+      name?: string;
+      access_token?: string;
+      link?: string;
+      is_published?: boolean;
+    }>;
+    error?: { message?: string };
+  };
+
+  if (accountsRes.ok && Array.isArray(accountsJson.data)) {
+    const availablePages = accountsJson.data.map((p) => ({
+      id: p.id,
+      name: p.name || p.id,
+    }));
+    const matched = accountsJson.data.find((p) => p.id === configuredPageId);
+
+    if (matched) {
+      if (!matched.access_token) {
+        return {
+          ok: false,
+          error: `Found Page "${matched.name || matched.id}", but Facebook did not return a Page Access Token. Re-generate the token with pages_manage_posts, pages_read_engagement, and pages_show_list.`,
+          availablePages,
+        };
+      }
+      const warnings: string[] = [
+        `Auto-resolved Page Access Token for "${matched.name || matched.id}" from your User Token. For long-term reliability, store the Page Access Token directly in FACEBOOK_ACCESS_TOKEN.`,
+      ];
+      if (matched.is_published === false) {
+        warnings.push('Your Facebook Page is currently set to Unpublished.');
+      }
+      return {
+        ok: true,
+        effectivePageId: matched.id,
+        effectiveToken: matched.access_token,
+        pageName: matched.name || matched.id,
+        pageLink: matched.link || `https://www.facebook.com/${matched.id}`,
+        isPublished: matched.is_published !== false,
+        isPageToken: true,
+        resolvedViaAccounts: true,
+        tokenOwnerId: meJson.id,
+        tokenOwnerName: meJson.name || null,
+        availablePages,
+        warnings,
+      };
+    }
+
+    const pagesHint =
+      availablePages.length > 0
+        ? ` Pages managed by your token: ${availablePages.map((p) => `${p.name} (${p.id})`).join(', ')}.`
+        : ' No Facebook Pages were returned under /me/accounts — ensure you selected a Page in Graph API Explorer and granted pages_show_list + pages_manage_posts + pages_read_engagement.';
+
+    if (configuredPageId === meJson.id) {
+      return {
+        ok: false,
+        error: `FACEBOOK_PAGE_ID (${configuredPageId}) is your personal Facebook User ID ("${meJson.name || meJson.id}"), not a Facebook Page ID. Facebook does not allow API posting to personal profiles.${pagesHint}`,
+        availablePages,
+      };
+    }
+
+    return {
+      ok: false,
+      error: `FACEBOOK_PAGE_ID (${configuredPageId}) was not found among the Pages accessible to this User Token.${pagesHint}`,
+      availablePages,
+    };
+  }
+
+  // configuredToken is a Page Access Token (or page-scoped): meJson.id IS the token's Page ID
+  if (meJson.id !== configuredPageId) {
+    return {
+      ok: false,
+      error: `Mismatch: FACEBOOK_ACCESS_TOKEN belongs to "${meJson.name || meJson.id}" (ID: ${meJson.id}), which does not match FACEBOOK_PAGE_ID (${configuredPageId}). Set FACEBOOK_PAGE_ID=${meJson.id} in Settings > Secrets (or generate a Page token for ${configuredPageId}).`,
+      availablePages: [{ id: meJson.id, name: meJson.name || meJson.id }],
+    };
+  }
+
+  const pageRes = await fetch(
+    `https://graph.facebook.com/v27.0/${encodeURIComponent(configuredPageId)}?fields=id,name,link,is_published&access_token=${encodeURIComponent(configuredToken)}`
+  );
+  const pageJson = (await pageRes.json().catch(() => ({}))) as {
+    id?: string;
+    name?: string;
+    link?: string;
+    is_published?: boolean;
+    error?: { message?: string };
+  };
+
+  if (!pageRes.ok || pageJson.error || !pageJson.id) {
+    return {
+      ok: false,
+      error:
+        pageJson.error?.message ||
+        `Unable to load Facebook Page ${configuredPageId} (HTTP ${pageRes.status}). Verify it is a Facebook Page ID (not a profile/App ID) and has pages_manage_posts + pages_read_engagement.`,
+    };
+  }
+
+  const warnings: string[] = [];
+  if (pageJson.is_published === false) {
+    warnings.push('Your Facebook Page itself is currently set to Unpublished.');
+  }
+
+  return {
+    ok: true,
+    effectivePageId: pageJson.id,
+    effectiveToken: configuredToken,
+    pageName: pageJson.name || pageJson.id,
+    pageLink: pageJson.link || `https://www.facebook.com/${pageJson.id}`,
+    isPublished: pageJson.is_published !== false,
+    isPageToken: true,
+    resolvedViaAccounts: false,
+    tokenOwnerId: meJson.id,
+    tokenOwnerName: meJson.name || null,
+    availablePages: [{ id: pageJson.id, name: pageJson.name || pageJson.id }],
+    warnings,
+  };
+}
+
 const activePublishingIds = new Set<string>();
 let nextSchedulerRunAt = new Date(Date.now() + SCHEDULER_INTERVAL_MS).toISOString();
 let lastSchedulerRunAt: string | null = null;
@@ -440,14 +605,36 @@ export async function createServerApp(options: { standalone?: boolean } = {}) {
         throw new Error(errMsg);
       }
 
+      const resolved = await resolveFacebookTarget(pageId, accessToken);
+      if (!resolved.ok) {
+        const failRes = await pool.query<DbPostRow>(
+          `UPDATE scheduled_posts
+           SET status = 'FAILED',
+               error_message = $2,
+               updated_at = NOW()
+           WHERE id = $1
+           RETURNING *`,
+          [postId, resolved.error]
+        );
+        const failed = serializePost(failRes.rows[0]);
+        broadcast({ type: 'post:updated', data: failed });
+        await recordLog(
+          'error',
+          'facebook',
+          `Facebook check failed for "${failed.topicName}" (${failed.slotTime})`,
+          resolved.error
+        );
+        throw new Error(resolved.error);
+      }
+
       const message = formatFbMessage(post);
       const graphUrl = `https://graph.facebook.com/v27.0/${encodeURIComponent(
-        pageId
+        resolved.effectivePageId
       )}/feed`;
       const params = new URLSearchParams();
       params.append('message', message);
       params.append('published', 'true');
-      params.append('access_token', accessToken);
+      params.append('access_token', resolved.effectiveToken);
 
       const fbRes = await fetch(graphUrl, {
         method: 'POST',
@@ -461,9 +648,12 @@ export async function createServerApp(options: { standalone?: boolean } = {}) {
       };
 
       if (!fbRes.ok || fbJson.error || !fbJson.id) {
-        const errMsg =
+        let errMsg =
           fbJson.error?.message ||
           `Facebook Graph API returned HTTP ${fbRes.status}`;
+        if (errMsg.includes('Unsupported post request')) {
+          errMsg = `${errMsg} — Check that FACEBOOK_PAGE_ID (${resolved.effectivePageId}) is a Facebook Page ID (not a personal profile or App ID) and the token has pages_manage_posts + pages_read_engagement permissions.`;
+        }
         const failRes = await pool.query<DbPostRow>(
           `UPDATE scheduled_posts
            SET status = 'FAILED',
@@ -1376,56 +1566,25 @@ Create a fresh angle and stronger hook distinct from: "${post.seoTitle}".`,
         });
       }
 
-      const [pageRes, meRes] = await Promise.all([
-        fetch(
-          `https://graph.facebook.com/v27.0/${encodeURIComponent(pageId)}?fields=id,name,link,is_published&access_token=${encodeURIComponent(accessToken)}`
-        ),
-        fetch(
-          `https://graph.facebook.com/v27.0/me?fields=id,name&access_token=${encodeURIComponent(accessToken)}`
-        ),
-      ]);
-
-      const pageJson = (await pageRes.json().catch(() => ({}))) as {
-        id?: string;
-        name?: string;
-        link?: string;
-        is_published?: boolean;
-        error?: { message?: string };
-      };
-      const meJson = (await meRes.json().catch(() => ({}))) as {
-        id?: string;
-        name?: string;
-        error?: { message?: string };
-      };
-
-      if (!pageRes.ok || pageJson.error || !pageJson.id) {
-        const errMsg =
-          pageJson.error?.message ||
-          `Facebook Graph API returned HTTP ${pageRes.status}`;
-        return res.status(400).json({ error: errMsg });
-      }
-
-      const isPageToken = Boolean(meJson.id && pageJson.id && meJson.id === pageJson.id);
-      const warnings: string[] = [];
-
-      if (!isPageToken) {
-        warnings.push(
-          `Token belongs to "${meJson.name || meJson.id || 'a User'}" rather than the Page itself. For public Page posts, generate a Page Access Token (not a User Token) with pages_manage_posts & pages_read_engagement.`
-        );
-      }
-      if (pageJson.is_published === false) {
-        warnings.push('Your Facebook Page itself is currently set to Unpublished.');
+      const resolved = await resolveFacebookTarget(pageId, accessToken);
+      if (!resolved.ok) {
+        return res.status(400).json({
+          error: resolved.error,
+          availablePages: resolved.availablePages ?? [],
+        });
       }
 
       return res.json({
         ok: true,
-        pageId: pageJson.id,
-        pageName: pageJson.name || pageJson.id,
-        pageLink: pageJson.link || `https://www.facebook.com/${pageJson.id}`,
-        isPublished: pageJson.is_published !== false,
-        isPageToken,
-        tokenOwnerName: meJson.name || null,
-        warnings,
+        pageId: resolved.effectivePageId,
+        pageName: resolved.pageName,
+        pageLink: resolved.pageLink,
+        isPublished: resolved.isPublished,
+        isPageToken: resolved.isPageToken,
+        resolvedViaAccounts: resolved.resolvedViaAccounts,
+        tokenOwnerName: resolved.tokenOwnerName,
+        availablePages: resolved.availablePages,
+        warnings: resolved.warnings,
       });
     } catch (err: unknown) {
       return res.status(500).json({
