@@ -32,6 +32,7 @@ import {
   verifySessionToken,
   type AuthenticatedRequest,
 } from './server/auth.ts';
+import { buildMl30DayCurriculumPosts } from './server/mlCurriculum.ts';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -115,6 +116,121 @@ export async function createServerApp(options: { standalone?: boolean } = {}) {
   const dbBoot = await initDatabase();
   if (!dbBoot.ok) {
     console.warn('Database not ready on boot:', dbBoot.error);
+  }
+
+  async function seedMlMonthCurriculum(opts: {
+    startDate?: string;
+    timezoneOffsetMinutes?: number;
+    onlyIfEmpty?: boolean;
+  } = {}): Promise<ReturnType<typeof serializePost>[]> {
+    const dbReady = await initDatabase();
+    if (!dbReady.ok) {
+      throw new Error(dbReady.error || 'Database unavailable.');
+    }
+    const pool = getPool();
+
+    if (opts.onlyIfEmpty) {
+      const metaRes = await pool.query<{ value: string }>(
+        `SELECT value FROM app_meta WHERE key = 'ml_month_seeded' LIMIT 1`
+      );
+      const countRes = await pool.query<{ cnt: number }>(
+        `SELECT COUNT(*)::int AS cnt FROM scheduled_posts`
+      );
+      if (metaRes.rows[0]?.value === 'true' || (countRes.rows[0]?.cnt ?? 0) > 0) {
+        return [];
+      }
+    }
+
+    const startDate =
+      opts.startDate?.trim() || new Date().toISOString().slice(0, 10);
+    const [startY, startM, startD] = startDate.split('-').map(Number);
+    // timezoneOffsetMinutes matches JS Date.getTimezoneOffset() (e.g. 480 for PST -08:00, -360 for +06:00)
+    const offsetMin =
+      typeof opts.timezoneOffsetMinutes === 'number' && !Number.isNaN(opts.timezoneOffsetMinutes)
+        ? opts.timezoneOffsetMinutes
+        : 480;
+
+    const curriculum = buildMl30DayCurriculumPosts();
+    const insertedPosts: ReturnType<typeof serializePost>[] = [];
+
+    for (const item of curriculum) {
+      const [hh, mm] = item.slotTime.split(':').map(Number);
+      // Compute UTC timestamp representing local YYYY-MM-DD HH:mm in caller's offset
+      const utcMs =
+        Date.UTC(
+          startY || 2026,
+          (startM || 11) - 1,
+          (startD || 24) + (item.dayNumber - 1),
+          hh || 9,
+          mm || 0,
+          0,
+          0
+        ) +
+        offsetMin * 60_000;
+
+      const scheduledDate = new Date(utcMs);
+      const localDateForMonth = new Date(utcMs - offsetMin * 60_000);
+      const monthKey = `${localDateForMonth.getUTCFullYear()}-${String(
+        localDateForMonth.getUTCMonth() + 1
+      ).padStart(2, '0')}`;
+
+      const id = makeId('post');
+      const res = await pool.query<DbPostRow>(
+        `INSERT INTO scheduled_posts (
+           id, month_key, topic_name, part_number, total_parts, stage_label,
+           seo_title, seo_description, seo_tags, slot_time, scheduled_at, status
+         )
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10, $11::timestamptz, 'PENDING')
+         RETURNING *`,
+        [
+          id,
+          monthKey,
+          item.topicName,
+          item.partNumber,
+          item.totalParts,
+          item.stageLabel,
+          item.seoTitle,
+          item.seoDescription,
+          JSON.stringify(item.seoTags),
+          item.slotTime,
+          scheduledDate.toISOString(),
+        ]
+      );
+      if (res.rows[0]) {
+        insertedPosts.push(serializePost(res.rows[0]));
+      }
+    }
+
+    await pool.query(
+      `UPDATE publisher_settings
+       SET recurring_times = '["09:00","15:00","18:00"]'::jsonb,
+           updated_at = NOW()
+       WHERE id = 1`
+    );
+
+    await pool.query(
+      `INSERT INTO app_meta (key, value)
+       VALUES ('ml_month_seeded', 'true')
+       ON CONFLICT (key) DO UPDATE SET value = 'true'`
+    );
+
+    if (insertedPosts.length > 0) {
+      broadcast({ type: 'posts:bulk_created', data: insertedPosts });
+      await recordLog(
+        'success',
+        'storage',
+        `Scheduled 30-day Machine Learning (Beginner to Advanced) series: ${insertedPosts.length} posts (3/day at 09:00, 15:00, 18:00).`,
+        `Start date: ${startDate}`
+      );
+    }
+
+    return insertedPosts;
+  }
+
+  if (dbBoot.ok) {
+    await seedMlMonthCurriculum({ onlyIfEmpty: true }).catch((err) => {
+      console.warn('Initial ML curriculum seed skipped:', err);
+    });
   }
 
   function broadcast(event: { type: string; data?: unknown }) {
@@ -461,12 +577,24 @@ export async function createServerApp(options: { standalone?: boolean } = {}) {
 
   app.get('/api/health', async (_req: Request, res: Response) => {
     const dbCheck = await initDatabase();
+    let scheduledPostsCount = 0;
+    if (dbCheck.ok) {
+      try {
+        const countRes = await getPool().query<{ cnt: number }>(
+          'SELECT COUNT(*)::int AS cnt FROM scheduled_posts'
+        );
+        scheduledPostsCount = countRes.rows[0]?.cnt ?? 0;
+      } catch {
+        // ignore count error on health check
+      }
+    }
     res.json({
       ok: true,
       model: GEMINI_MODEL,
       realtimeMode: standalone ? 'websocket' : 'http-sync',
       dbConnected: dbCheck.ok,
       dbError: dbCheck.error,
+      scheduledPostsCount,
     });
   });
 
@@ -885,6 +1013,31 @@ export async function createServerApp(options: { standalone?: boolean } = {}) {
     } catch (err: unknown) {
       return res.status(500).json({
         error: err instanceof Error ? err.message : 'Failed to apply recurring slots.',
+      });
+    }
+  });
+
+  app.post('/api/posts/seed-ml-month', requireAuth, async (req: AuthenticatedRequest, res: Response) => {
+    try {
+      const startDate =
+        typeof req.body?.startDate === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(req.body.startDate)
+          ? req.body.startDate
+          : undefined;
+      const timezoneOffsetMinutes =
+        typeof req.body?.timezoneOffsetMinutes === 'number'
+          ? req.body.timezoneOffsetMinutes
+          : undefined;
+
+      const created = await seedMlMonthCurriculum({
+        startDate,
+        timezoneOffsetMinutes,
+        onlyIfEmpty: false,
+      });
+
+      return res.json({ posts: created, count: created.length });
+    } catch (err: unknown) {
+      return res.status(500).json({
+        error: err instanceof Error ? err.message : 'Failed to seed ML curriculum.',
       });
     }
   });

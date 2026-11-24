@@ -56,6 +56,7 @@ export default function App() {
   >('connecting');
   const [isGenerating, setIsGenerating] = useState<boolean>(false);
   const [isApplyingSlots, setIsApplyingSlots] = useState<boolean>(false);
+  const [isSeedingMl, setIsSeedingMl] = useState<boolean>(false);
   const [generatorError, setGeneratorError] = useState<string | null>(null);
   const [publishingIds, setPublishingIds] = useState<Set<string>>(() => new Set());
   const [regeneratingIds, setRegeneratingIds] = useState<Set<string>>(() => new Set());
@@ -438,6 +439,41 @@ export default function App() {
     }
   };
 
+  const handleSeedMlMonth = async (startDate: string) => {
+    setIsSeedingMl(true);
+    setGeneratorError(null);
+    try {
+      const res = await apiFetch<{ posts: ScheduledPost[]; count: number }>(
+        '/api/posts/seed-ml-month',
+        {
+          method: 'POST',
+          body: JSON.stringify({
+            startDate,
+            timezoneOffsetMinutes: new Date().getTimezoneOffset(),
+          }),
+        }
+      );
+      if (res.posts?.length) {
+        setPosts((prev) => {
+          const existingIds = new Set(prev.map((p) => p.id));
+          const additions = res.posts.filter((p) => !existingIds.has(p.id));
+          return [...prev, ...additions];
+        });
+      }
+      setSettings((prev) => ({
+        ...prev,
+        recurringTimes: ['09:00', '15:00', '18:00'],
+      }));
+      if (!socketConnected) void refreshWorkspaceViaRest();
+    } catch (err: unknown) {
+      setGeneratorError(
+        err instanceof Error ? err.message : 'Failed to load 30-day ML curriculum.'
+      );
+    } finally {
+      setIsSeedingMl(false);
+    }
+  };
+
   const handleAddManualPost = async (payload: {
     topicName: string;
     stageLabel: string;
@@ -736,11 +772,13 @@ export default function App() {
               pendingCount={counts.pending}
               isGenerating={isGenerating}
               isApplyingSlots={isApplyingSlots}
+              isSeedingMl={isSeedingMl}
               errorMessage={generatorError}
               onUpdateRecurringTimes={(times) =>
                 handleSaveSettings({ recurringTimes: times })
               }
               onApplySlotsToPending={handleApplySlotsToPending}
+              onSeedMlMonth={handleSeedMlMonth}
               onGenerateMonthly={handleGenerateMonthly}
             />
 

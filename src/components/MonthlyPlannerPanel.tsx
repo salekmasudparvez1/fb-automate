@@ -1,5 +1,6 @@
 import React, { useMemo, useState } from 'react';
 import {
+  BookOpen,
   Calendar,
   Clock,
   Loader2,
@@ -21,9 +22,11 @@ interface MonthlyPlannerPanelProps {
   pendingCount: number;
   isGenerating: boolean;
   isApplyingSlots: boolean;
+  isSeedingMl: boolean;
   errorMessage: string | null;
   onUpdateRecurringTimes: (times: string[]) => Promise<void>;
   onApplySlotsToPending: () => Promise<void>;
+  onSeedMlMonth: (startDate: string) => Promise<void>;
   onGenerateMonthly: (params: {
     themeOrTopic: string;
     topicMode: 'theme' | 'custom_list';
@@ -39,9 +42,11 @@ export const MonthlyPlannerPanel: React.FC<MonthlyPlannerPanelProps> = ({
   pendingCount,
   isGenerating,
   isApplyingSlots,
+  isSeedingMl,
   errorMessage,
   onUpdateRecurringTimes,
   onApplySlotsToPending,
+  onSeedMlMonth,
   onGenerateMonthly,
 }) => {
   const [monthKey, setMonthKey] = useState<string>(() => getCurrentMonthKey());
@@ -446,7 +451,7 @@ export const MonthlyPlannerPanel: React.FC<MonthlyPlannerPanelProps> = ({
 
         <button
           type="submit"
-          disabled={isGenerating || computedSlots.length === 0}
+          disabled={isGenerating || isSeedingMl || computedSlots.length === 0}
           className="w-full py-2.5 px-4 text-sm font-semibold text-white bg-blue-700 hover:bg-blue-800 disabled:bg-blue-400 rounded-lg transition-colors flex items-center justify-center gap-2 whitespace-nowrap cursor-pointer"
         >
           {isGenerating ? (
@@ -461,6 +466,42 @@ export const MonthlyPlannerPanel: React.FC<MonthlyPlannerPanelProps> = ({
             </>
           )}
         </button>
+
+        <div className="pt-3 border-t border-slate-200">
+          <div className="flex items-center justify-between gap-2 mb-2">
+            <span className="text-xs font-semibold text-slate-800">
+              Curated 30-Day Pack (Manual)
+            </span>
+            <span className="text-[11px] font-mono tabular-nums text-slate-500">
+              90 posts · 3/day
+            </span>
+          </div>
+          <p className="text-[11px] text-slate-600 mb-2.5">
+            Beginner to Advanced Machine Learning topics, SEO titles, body copy &amp; tags at 09:00 AM, 03:00 PM &amp; 06:00 PM starting {monthKey}-{String(Math.max(1, Math.min(startDay, daysInSelectedMonth))).padStart(2, '0')}.
+          </p>
+          <button
+            type="button"
+            disabled={isGenerating || isSeedingMl}
+            onClick={() => {
+              const clampedDay = Math.max(1, Math.min(startDay, daysInSelectedMonth));
+              const startDate = `${monthKey}-${String(clampedDay).padStart(2, '0')}`;
+              void onSeedMlMonth(startDate);
+            }}
+            className="w-full py-2 px-3 text-xs font-semibold text-slate-800 bg-slate-100 hover:bg-slate-200 disabled:opacity-60 border border-slate-300 rounded-lg transition-colors flex items-center justify-center gap-2 whitespace-nowrap cursor-pointer"
+          >
+            {isSeedingMl ? (
+              <>
+                <Loader2 className="w-3.5 h-3.5 animate-spin text-blue-700" />
+                <span>Scheduling 90 ML Posts...</span>
+              </>
+            ) : (
+              <>
+                <BookOpen className="w-3.5 h-3.5 text-blue-700" />
+                <span>Load 30-Day ML Curriculum (90 Posts)</span>
+              </>
+            )}
+          </button>
+        </div>
       </form>
     </section>
   );
