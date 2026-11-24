@@ -51,6 +51,14 @@ import {
   verifyPlaintextConstantTime,
   type AuthenticatedRequest,
 } from './server/auth.ts';
+import {
+  exchangeForPermanentPageToken,
+  getFacebookAppCredentials,
+  getFacebookTokenMetaStatus,
+  isFacebookTokenError,
+  resolveEffectiveEnvFacebookCredentials,
+  setFacebookTokenErrorNotice,
+} from './server/fbToken.ts';
 import { buildMl30DayCurriculumPosts } from './server/mlCurriculum.ts';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -130,6 +138,7 @@ type ResolvedFacebookTarget =
       isPublished: boolean;
       isPageToken: boolean;
       resolvedViaAccounts: boolean;
+      permanentExchanged?: boolean;
       tokenOwnerId: string;
       tokenOwnerName: string | null;
       availablePages: Array<{ id: string; name: string }>;
@@ -138,8 +147,16 @@ type ResolvedFacebookTarget =
   | {
       ok: false;
       error: string;
+      tokenExpired?: boolean;
       availablePages?: Array<{ id: string; name: string }>;
     };
+
+class FacebookTokenExpiredError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'FacebookTokenExpiredError';
+  }
+}
 
 async function resolveFacebookTarget(
   configuredPageId: string,
@@ -151,12 +168,14 @@ async function resolveFacebookTarget(
   const meJson = (await meRes.json().catch(() => ({}))) as {
     id?: string;
     name?: string;
-    error?: { message?: string };
+    error?: { code?: number; error_subcode?: number; message?: string };
   };
 
   if (!meRes.ok || meJson.error || !meJson.id) {
+    const expired = isFacebookTokenError(meJson.error, meRes.status);
     return {
       ok: false,
+      tokenExpired: expired,
       error:
         meJson.error?.message ||
         `Invalid FACEBOOK_ACCESS_TOKEN (HTTP ${meRes.status}).`,
@@ -175,7 +194,7 @@ async function resolveFacebookTarget(
       link?: string;
       is_published?: boolean;
     }>;
-    error?: { message?: string };
+    error?: { code?: number; error_subcode?: number; message?: string };
   };
 
   if (accountsRes.ok && Array.isArray(accountsJson.data)) {
@@ -193,8 +212,39 @@ async function resolveFacebookTarget(
           availablePages,
         };
       }
+
+      // Automatically upgrade short-lived User Token -> Never-Expiring Page Token if App credentials exist
+      const appCreds = getFacebookAppCredentials();
+      if (appCreds.appId && appCreds.appSecret) {
+        const exchanged = await exchangeForPermanentPageToken(
+          configuredPageId,
+          configuredToken
+        );
+        if (exchanged.ok) {
+          const warnings: string[] = [];
+          if (matched.is_published === false) {
+            warnings.push('Your Facebook Page is currently set to Unpublished.');
+          }
+          return {
+            ok: true,
+            effectivePageId: matched.id,
+            effectiveToken: exchanged.permanentPageToken,
+            pageName: matched.name || matched.id,
+            pageLink: matched.link || `https://www.facebook.com/${matched.id}`,
+            isPublished: matched.is_published !== false,
+            isPageToken: true,
+            resolvedViaAccounts: true,
+            permanentExchanged: true,
+            tokenOwnerId: meJson.id,
+            tokenOwnerName: meJson.name || null,
+            availablePages,
+            warnings,
+          };
+        }
+      }
+
       const warnings: string[] = [
-        `Auto-resolved Page Access Token for "${matched.name || matched.id}" from your User Token. For long-term reliability, store the Page Access Token directly in FACEBOOK_ACCESS_TOKEN.`,
+        `Resolved Page Access Token from a User Token. To prevent 2-hour session expiry, set FACEBOOK_APP_ID + FACEBOOK_APP_SECRET in Secrets for automatic never-expiring token exchange (or store a permanent Page Token directly in FACEBOOK_ACCESS_TOKEN).`,
       ];
       if (matched.is_published === false) {
         warnings.push('Your Facebook Page is currently set to Unpublished.');
@@ -208,6 +258,7 @@ async function resolveFacebookTarget(
         isPublished: matched.is_published !== false,
         isPageToken: true,
         resolvedViaAccounts: true,
+        permanentExchanged: false,
         tokenOwnerId: meJson.id,
         tokenOwnerName: meJson.name || null,
         availablePages,
@@ -514,6 +565,29 @@ export async function createServerApp(options: { standalone?: boolean } = {}) {
     }
   }
 
+  async function buildSerializedSettings(row?: DbSettingsRow) {
+    const envCreds = getEnvFacebookCredentials();
+    const tokenStatus = await getFacebookTokenMetaStatus();
+    const base = row
+      ? serializeSettings(row)
+      : {
+          facebookPageId: envCreds.pageId,
+          hasAccessToken: envCreds.accessToken.length > 0,
+          maskedAccessToken: envCreds.accessToken
+            ? envCreds.accessToken.length > 10
+              ? `${envCreds.accessToken.slice(0, 6)}••••••${envCreds.accessToken.slice(-4)}`
+              : '••••••••'
+            : '',
+          autoPublishEnabled: true,
+          dryRunMode: true,
+          recurringTimes: ['09:00', '15:00', '18:00'],
+        };
+    return {
+      ...base,
+      tokenStatus,
+    };
+  }
+
   async function loadFullWorkspaceState() {
     const pool = getPool();
     const [postsRes, settingsRes, logsRes] = await Promise.all([
@@ -528,27 +602,9 @@ export async function createServerApp(options: { standalone?: boolean } = {}) {
       ),
     ]);
 
-    const envCreds = getEnvFacebookCredentials();
-    const fallbackToken = envCreds.accessToken;
-    const maskedToken =
-      fallbackToken.length > 10
-        ? `${fallbackToken.slice(0, 6)}••••••${fallbackToken.slice(-4)}`
-        : fallbackToken
-          ? '••••••••'
-          : '';
-
     return {
       posts: postsRes.rows.map(serializePost),
-      settings: settingsRes.rows[0]
-        ? serializeSettings(settingsRes.rows[0])
-        : {
-            facebookPageId: envCreds.pageId,
-            hasAccessToken: fallbackToken.length > 0,
-            maskedAccessToken: maskedToken,
-            autoPublishEnabled: true,
-            dryRunMode: true,
-            recurringTimes: ['09:00', '15:00', '18:00'],
-          },
+      settings: await buildSerializedSettings(settingsRes.rows[0]),
       logs: logsRes.rows.map(serializeLog),
       scheduler: {
         intervalSeconds: SCHEDULER_INTERVAL_MS / 1000,
@@ -635,7 +691,7 @@ export async function createServerApp(options: { standalone?: boolean } = {}) {
       );
       const settingsRow = settingsRes.rows[0];
       const isDryRun = settingsRow ? Boolean(settingsRow.dry_run_mode) : true;
-      const { pageId, accessToken } = getEnvFacebookCredentials();
+      const { pageId, accessToken } = await resolveEffectiveEnvFacebookCredentials();
 
       if (isDryRun) {
         const simPage = pageId || 'sim_page';
@@ -686,8 +742,32 @@ export async function createServerApp(options: { standalone?: boolean } = {}) {
         throw new Error(errMsg);
       }
 
+      const handleTokenExpiryPause = async (expiredMessage: string) => {
+        const friendly = `${expiredMessage} Auto-publish paused and posts kept PENDING so your queue does not fail while you are away. Update FACEBOOK_ACCESS_TOKEN in Secrets (or configure FACEBOOK_APP_ID & FACEBOOK_APP_SECRET for a never-expiring Page Token).`;
+        await setFacebookTokenErrorNotice(friendly);
+        const pausedRes = await pool.query<DbSettingsRow>(
+          `UPDATE publisher_settings
+           SET auto_publish_enabled = FALSE,
+               updated_at = NOW()
+           WHERE id = 1
+           RETURNING *`
+        );
+        const serializedSettings = await buildSerializedSettings(pausedRes.rows[0]);
+        broadcast({ type: 'settings:updated', data: serializedSettings });
+        await recordLog(
+          'warning',
+          'facebook',
+          'Facebook Access Token expired — paused auto-publish and preserved PENDING queue.',
+          expiredMessage
+        );
+        throw new FacebookTokenExpiredError(friendly);
+      };
+
       const resolved = await resolveFacebookTarget(pageId, accessToken);
       if (!resolved.ok) {
+        if (resolved.tokenExpired) {
+          await handleTokenExpiryPause(resolved.error);
+        }
         const failRes = await pool.query<DbPostRow>(
           `UPDATE scheduled_posts
            SET status = 'FAILED',
@@ -725,13 +805,16 @@ export async function createServerApp(options: { standalone?: boolean } = {}) {
 
       const fbJson = (await fbRes.json().catch(() => ({}))) as {
         id?: string;
-        error?: { message?: string };
+        error?: { code?: number; error_subcode?: number; message?: string };
       };
 
       if (!fbRes.ok || fbJson.error || !fbJson.id) {
         let errMsg =
           fbJson.error?.message ||
           `Facebook Graph API returned HTTP ${fbRes.status}`;
+        if (isFacebookTokenError(fbJson.error, fbRes.status)) {
+          await handleTokenExpiryPause(errMsg);
+        }
         if (errMsg.includes('Unsupported post request')) {
           errMsg = `${errMsg} — Check that FACEBOOK_PAGE_ID (${resolved.effectivePageId}) is a Facebook Page ID (not a personal profile or App ID) and the token has pages_manage_posts + pages_read_engagement permissions.`;
         }
@@ -754,6 +837,9 @@ export async function createServerApp(options: { standalone?: boolean } = {}) {
         );
         throw new Error(errMsg);
       }
+
+      // Successful live publish clears any previous token expiration banner
+      await setFacebookTokenErrorNotice('');
 
       const okRes = await pool.query<DbPostRow>(
         `UPDATE scheduled_posts
@@ -838,8 +924,12 @@ export async function createServerApp(options: { standalone?: boolean } = {}) {
         if (!activePublishingIds.has(row.id)) {
           try {
             await publishPostById(row.id, 'scheduler');
-          } catch {
-            // Error already persisted and broadcast
+          } catch (err) {
+            if (err instanceof FacebookTokenExpiredError) {
+              // Stop batch immediately so remaining due posts stay PENDING
+              break;
+            }
+            // Other errors already persisted and broadcast
           }
         }
       }
@@ -1441,21 +1531,147 @@ export async function createServerApp(options: { standalone?: boolean } = {}) {
         return res.status(503).json({ error: dbCheck.error });
       }
       const pool = getPool();
-      const monthKey = String(req.query.monthKey ?? '').trim();
 
-      const result = monthKey && monthKey !== 'ALL'
-        ? await pool.query<DbPostRow>(
-            'SELECT * FROM scheduled_posts WHERE month_key = $1 ORDER BY scheduled_at ASC, part_number ASC',
-            [monthKey]
-          )
-        : await pool.query<DbPostRow>(
-            'SELECT * FROM scheduled_posts ORDER BY scheduled_at ASC, part_number ASC'
-          );
+      const monthKey = String(req.query.monthKey ?? 'ALL').trim();
+      const statusFilter = String(req.query.status ?? 'ALL').trim().toUpperCase();
+      const search = String(req.query.search ?? '').trim();
+      const sortParam = String(req.query.sort ?? 'asc').trim().toLowerCase();
+      const page = Math.max(1, Math.floor(Number(req.query.page) || 1));
+      const limit = Math.max(5, Math.min(100, Math.floor(Number(req.query.limit) || 15)));
 
-      return res.json({ posts: result.rows.map(serializePost) });
+      const monthConditions: string[] = [];
+      const monthParams: string[] = [];
+
+      if (monthKey && monthKey !== 'ALL') {
+        monthParams.push(monthKey);
+        monthConditions.push(`month_key = $${monthParams.length}`);
+      }
+
+      const monthWhereSql =
+        monthConditions.length > 0 ? `WHERE ${monthConditions.join(' AND ')}` : '';
+
+      const itemConditions = [...monthConditions];
+      const itemParams: Array<string | number> = [...monthParams];
+
+      if (statusFilter === 'PENDING' || statusFilter === 'POSTED' || statusFilter === 'FAILED') {
+        itemParams.push(statusFilter);
+        itemConditions.push(`status = $${itemParams.length}`);
+      }
+
+      if (search) {
+        itemParams.push(`%${search}%`);
+        const pIdx = itemParams.length;
+        itemConditions.push(
+          `(topic_name ILIKE $${pIdx} OR stage_label ILIKE $${pIdx} OR seo_title ILIKE $${pIdx} OR seo_description ILIKE $${pIdx} OR COALESCE(fb_post_id, '') ILIKE $${pIdx} OR seo_tags::text ILIKE $${pIdx})`
+        );
+      }
+
+      const itemWhereSql =
+        itemConditions.length > 0 ? `WHERE ${itemConditions.join(' AND ')}` : '';
+
+      const orderBySql =
+        sortParam === 'desc'
+          ? 'ORDER BY scheduled_at DESC, part_number DESC'
+          : sortParam === 'updated'
+            ? 'ORDER BY updated_at DESC, scheduled_at ASC'
+            : 'ORDER BY scheduled_at ASC, part_number ASC';
+
+      const [countsRes, totalRes, monthsRes] = await Promise.all([
+        pool.query<{
+          total: number;
+          pending: number;
+          posted: number;
+          simulated: number;
+          failed: number;
+        }>(
+          `SELECT
+             COUNT(*)::int AS total,
+             COUNT(*) FILTER (WHERE status = 'PENDING')::int AS pending,
+             COUNT(*) FILTER (WHERE status = 'POSTED')::int AS posted,
+             COUNT(*) FILTER (WHERE status = 'POSTED' AND is_simulated = TRUE)::int AS simulated,
+             COUNT(*) FILTER (WHERE status = 'FAILED')::int AS failed
+           FROM scheduled_posts
+           ${monthWhereSql}`,
+          monthParams
+        ),
+        pool.query<{ cnt: number }>(
+          `SELECT COUNT(*)::int AS cnt FROM scheduled_posts ${itemWhereSql}`,
+          itemParams
+        ),
+        pool.query<{ month_key: string }>(
+          `SELECT DISTINCT month_key FROM scheduled_posts ORDER BY month_key ASC`
+        ),
+      ]);
+
+      const totalItems = Number(totalRes.rows[0]?.cnt ?? 0);
+      const totalPages = Math.max(1, Math.ceil(totalItems / limit));
+      const safePage = Math.min(page, totalPages);
+      const offset = (safePage - 1) * limit;
+
+      const rowsRes = await pool.query<DbPostRow>(
+        `SELECT * FROM scheduled_posts
+         ${itemWhereSql}
+         ${orderBySql}
+         LIMIT $${itemParams.length + 1}
+         OFFSET $${itemParams.length + 2}`,
+        [...itemParams, limit, offset]
+      );
+
+      const c = countsRes.rows[0];
+      return res.json({
+        posts: rowsRes.rows.map(serializePost),
+        pagination: {
+          page: safePage,
+          limit,
+          totalItems,
+          totalPages,
+          hasNextPage: safePage < totalPages,
+          hasPrevPage: safePage > 1,
+        },
+        counts: {
+          all: Number(c?.total ?? 0),
+          pending: Number(c?.pending ?? 0),
+          posted: Number(c?.posted ?? 0),
+          simulated: Number(c?.simulated ?? 0),
+          failed: Number(c?.failed ?? 0),
+        },
+        availableMonths: monthsRes.rows.map((r) => r.month_key),
+      });
     } catch (err: unknown) {
       return res.status(500).json({
         error: err instanceof Error ? err.message : 'Failed to load posts.',
+      });
+    }
+  });
+
+  app.post('/api/posts/requeue-failed', requireAuth, async (_req: AuthenticatedRequest, res: Response) => {
+    try {
+      const dbCheck = await initDatabase();
+      if (!dbCheck.ok) {
+        return res.status(503).json({ error: dbCheck.error });
+      }
+      const pool = getPool();
+      const updatedRes = await pool.query<DbPostRow>(
+        `UPDATE scheduled_posts
+         SET status = 'PENDING',
+             error_message = NULL,
+             updated_at = NOW()
+         WHERE status = 'FAILED'
+         RETURNING *`
+      );
+      const requeued = updatedRes.rows.map(serializePost);
+      if (requeued.length > 0) {
+        broadcast({ type: 'posts:bulk_updated', data: requeued });
+        await recordLog(
+          'info',
+          'scheduler',
+          `Re-queued ${requeued.length} previously failed post${requeued.length === 1 ? '' : 's'} back to PENDING.`
+        );
+      }
+      return res.json({ count: requeued.length, posts: requeued });
+    } catch (err: unknown) {
+      return res.status(500).json({
+        error: err instanceof Error ? err.message : 'Failed to re-queue failed posts.',
       });
     }
   });
@@ -1961,7 +2177,7 @@ Create a fresh angle and stronger hook distinct from: "${post.seoTitle}".`,
       const result = await pool.query<DbSettingsRow>(
         'SELECT * FROM publisher_settings WHERE id = 1 LIMIT 1'
       );
-      return res.json({ settings: serializeSettings(result.rows[0]) });
+      return res.json({ settings: await buildSerializedSettings(result.rows[0]) });
     } catch (err: unknown) {
       return res.status(500).json({
         error: err instanceof Error ? err.message : 'Failed to load settings.',
@@ -2019,7 +2235,11 @@ Create a fresh angle and stronger hook distinct from: "${post.seoTitle}".`,
         [autoPublishEnabled, dryRunMode, JSON.stringify(recurringTimes)]
       );
 
-      const serialized = serializeSettings(updatedRes.rows[0]);
+      if (autoPublishEnabled) {
+        await setFacebookTokenErrorNotice('');
+      }
+
+      const serialized = await buildSerializedSettings(updatedRes.rows[0]);
       broadcast({ type: 'settings:updated', data: serialized });
       await recordLog(
         'info',
@@ -2036,7 +2256,7 @@ Create a fresh angle and stronger hook distinct from: "${post.seoTitle}".`,
 
   app.post('/api/facebook/verify', requireAuth, async (_req: AuthenticatedRequest, res: Response) => {
     try {
-      const { pageId, accessToken } = getEnvFacebookCredentials();
+      const { pageId, accessToken } = await resolveEffectiveEnvFacebookCredentials();
 
       if (!pageId || !accessToken) {
         return res.status(400).json({
@@ -2047,11 +2267,25 @@ Create a fresh angle and stronger hook distinct from: "${post.seoTitle}".`,
 
       const resolved = await resolveFacebookTarget(pageId, accessToken);
       if (!resolved.ok) {
+        if (resolved.tokenExpired) {
+          await setFacebookTokenErrorNotice(resolved.error);
+        }
         return res.status(400).json({
           error: resolved.error,
+          tokenExpired: Boolean(resolved.tokenExpired),
           availablePages: resolved.availablePages ?? [],
         });
       }
+
+      await setFacebookTokenErrorNotice('');
+      const updatedSettings = await buildSerializedSettings(
+        (
+          await getPool().query<DbSettingsRow>(
+            'SELECT * FROM publisher_settings WHERE id = 1 LIMIT 1'
+          )
+        ).rows[0]
+      );
+      broadcast({ type: 'settings:updated', data: updatedSettings });
 
       return res.json({
         ok: true,
@@ -2061,6 +2295,7 @@ Create a fresh angle and stronger hook distinct from: "${post.seoTitle}".`,
         isPublished: resolved.isPublished,
         isPageToken: resolved.isPageToken,
         resolvedViaAccounts: resolved.resolvedViaAccounts,
+        permanentExchanged: Boolean(resolved.permanentExchanged),
         tokenOwnerName: resolved.tokenOwnerName,
         availablePages: resolved.availablePages,
         warnings: resolved.warnings,
@@ -2068,6 +2303,51 @@ Create a fresh angle and stronger hook distinct from: "${post.seoTitle}".`,
     } catch (err: unknown) {
       return res.status(500).json({
         error: err instanceof Error ? err.message : 'Facebook verification failed.',
+      });
+    }
+  });
+
+  app.post('/api/facebook/exchange-token', requireAuth, async (req: AuthenticatedRequest, res: Response) => {
+    try {
+      const { pageId, accessToken: envToken } = getEnvFacebookCredentials();
+      const inputToken = String(req.body?.shortLivedToken ?? '').trim() || envToken;
+
+      if (!pageId || !inputToken) {
+        return res.status(400).json({
+          error:
+            'Provide a valid short-lived Facebook User Token (or set FACEBOOK_PAGE_ID and FACEBOOK_ACCESS_TOKEN in Secrets).',
+        });
+      }
+
+      const exchanged = await exchangeForPermanentPageToken(pageId, inputToken);
+      if (!exchanged.ok) {
+        return res.status(400).json({ error: exchanged.error });
+      }
+
+      const settingsRow = (
+        await getPool().query<DbSettingsRow>(
+          'SELECT * FROM publisher_settings WHERE id = 1 LIMIT 1'
+        )
+      ).rows[0];
+      const serialized = await buildSerializedSettings(settingsRow);
+      broadcast({ type: 'settings:updated', data: serialized });
+
+      await recordLog(
+        'success',
+        'facebook',
+        `Exchanged and stored encrypted permanent Page Access Token for "${exchanged.pageName}".`
+      );
+
+      return res.json({
+        ok: true,
+        pageId: exchanged.pageId,
+        pageName: exchanged.pageName,
+        expiresLabel: exchanged.expiresLabel,
+        settings: serialized,
+      });
+    } catch (err: unknown) {
+      return res.status(500).json({
+        error: err instanceof Error ? err.message : 'Failed to exchange Facebook token.',
       });
     }
   });

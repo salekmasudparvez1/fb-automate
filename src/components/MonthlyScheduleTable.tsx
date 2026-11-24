@@ -1,7 +1,11 @@
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   Check,
   CheckCircle2,
+  ChevronLeft,
+  ChevronRight,
+  ChevronsLeft,
+  ChevronsRight,
   Clock,
   Edit3,
   ExternalLink,
@@ -17,7 +21,13 @@ import {
   X,
   XCircle,
 } from 'lucide-react';
-import type { QueueFilter, ScheduledPost } from '../types';
+import type {
+  PaginatedPostsResponse,
+  PaginationMeta,
+  PostSortOrder,
+  QueueFilter,
+  ScheduledPost,
+} from '../types';
 import {
   formatDateOnly,
   formatDateTimeDisplay,
@@ -30,7 +40,8 @@ import {
 import { FacebookFeedPreview } from './FacebookFeedPreview';
 
 interface MonthlyScheduleTableProps {
-  posts: ScheduledPost[];
+  apiFetch: <T>(url: string, options?: RequestInit) => Promise<T>;
+  refreshKey: number;
   recurringTimes: string[];
   publishingIds: Set<string>;
   regeneratingIds: Set<string>;
@@ -38,6 +49,8 @@ interface MonthlyScheduleTableProps {
   pageName?: string;
   initialFilter?: QueueFilter;
   externalAddTrigger?: number;
+  isRequeuingFailed?: boolean;
+  onRequeueFailed: () => Promise<void>;
   onAddManualPost: (payload: {
     topicName: string;
     stageLabel: string;
@@ -85,8 +98,27 @@ const STATUS_META = {
   },
 } as const;
 
+const PAGE_SIZE_OPTIONS = [10, 15, 25, 50] as const;
+
+function buildPageNumbers(current: number, total: number): Array<number | 'ellipsis'> {
+  if (total <= 7) {
+    return Array.from({ length: total }, (_, i) => i + 1);
+  }
+  const pages: Array<number | 'ellipsis'> = [1];
+  const left = Math.max(2, current - 1);
+  const right = Math.min(total - 1, current + 1);
+
+  if (left > 2) pages.push('ellipsis');
+  for (let p = left; p <= right; p += 1) pages.push(p);
+  if (right < total - 1) pages.push('ellipsis');
+
+  pages.push(total);
+  return pages;
+}
+
 export const MonthlyScheduleTable: React.FC<MonthlyScheduleTableProps> = ({
-  posts,
+  apiFetch,
+  refreshKey,
   recurringTimes,
   publishingIds,
   regeneratingIds,
@@ -94,6 +126,8 @@ export const MonthlyScheduleTable: React.FC<MonthlyScheduleTableProps> = ({
   pageName = 'Parvez Dev',
   initialFilter = 'ALL',
   externalAddTrigger = 0,
+  isRequeuingFailed = false,
+  onRequeueFailed,
   onAddManualPost,
   onUpdatePost,
   onPublishNow,
@@ -102,11 +136,39 @@ export const MonthlyScheduleTable: React.FC<MonthlyScheduleTableProps> = ({
 }) => {
   const [selectedMonth, setSelectedMonth] = useState<string>('ALL');
   const [activeTab, setActiveTab] = useState<QueueFilter>(initialFilter);
-  const [searchQuery, setSearchQuery] = useState<string>('');
+  const [searchInput, setSearchInput] = useState<string>('');
+  const [debouncedSearch, setDebouncedSearch] = useState<string>('');
+  const [sortOrder, setSortOrder] = useState<PostSortOrder>('asc');
+  const [page, setPage] = useState<number>(1);
+  const [limit, setLimit] = useState<number>(15);
   const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null);
+
+  // Server-side paginated response state
+  const [rows, setRows] = useState<ScheduledPost[]>([]);
+  const [pagination, setPagination] = useState<PaginationMeta>({
+    page: 1,
+    limit: 15,
+    totalItems: 0,
+    totalPages: 1,
+    hasNextPage: false,
+    hasPrevPage: false,
+  });
+  const [counts, setCounts] = useState({
+    all: 0,
+    pending: 0,
+    posted: 0,
+    simulated: 0,
+    failed: 0,
+  });
+  const [availableMonths, setAvailableMonths] = useState<string[]>([]);
+  const [isLoading, setIsLoading] = useState<boolean>(true);
+  const [hasLoadedOnce, setHasLoadedOnce] = useState<boolean>(false);
+  const [loadError, setLoadError] = useState<string | null>(null);
+  const requestSeqRef = useRef<number>(0);
 
   useEffect(() => {
     setActiveTab(initialFilter);
+    setPage(1);
   }, [initialFilter]);
 
   useEffect(() => {
@@ -114,6 +176,58 @@ export const MonthlyScheduleTable: React.FC<MonthlyScheduleTableProps> = ({
       setIsAddOpen(true);
     }
   }, [externalAddTrigger]);
+
+  // Debounce search input before hitting server
+  useEffect(() => {
+    const timer = window.setTimeout(() => {
+      setDebouncedSearch(searchInput.trim());
+      setPage(1);
+    }, 250);
+    return () => window.clearTimeout(timer);
+  }, [searchInput]);
+
+  const fetchPaginatedPosts = useCallback(async () => {
+    const seq = ++requestSeqRef.current;
+    setIsLoading(true);
+    setLoadError(null);
+    try {
+      const params = new URLSearchParams({
+        page: String(page),
+        limit: String(limit),
+        status: activeTab,
+        monthKey: selectedMonth,
+        sort: sortOrder,
+      });
+      if (debouncedSearch) {
+        params.set('search', debouncedSearch);
+      }
+      const res = await apiFetch<PaginatedPostsResponse>(
+        `/api/posts?${params.toString()}`
+      );
+      if (seq !== requestSeqRef.current) return;
+      setRows(res.posts || []);
+      setPagination(res.pagination);
+      setCounts(res.counts);
+      setAvailableMonths(res.availableMonths || []);
+      if (res.pagination && res.pagination.page !== page) {
+        setPage(res.pagination.page);
+      }
+      setHasLoadedOnce(true);
+    } catch (err: unknown) {
+      if (seq !== requestSeqRef.current) return;
+      setLoadError(
+        err instanceof Error ? err.message : 'Failed to load scheduled posts.'
+      );
+    } finally {
+      if (seq === requestSeqRef.current) {
+        setIsLoading(false);
+      }
+    }
+  }, [apiFetch, page, limit, activeTab, selectedMonth, sortOrder, debouncedSearch]);
+
+  useEffect(() => {
+    void fetchPaginatedPosts();
+  }, [fetchPaginatedPosts, refreshKey]);
 
   // Edit/Inspect modal state
   const [editingPost, setEditingPost] = useState<ScheduledPost | null>(null);
@@ -138,42 +252,6 @@ export const MonthlyScheduleTable: React.FC<MonthlyScheduleTableProps> = ({
     return `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}T${slot}`;
   });
   const [isAdding, setIsAdding] = useState(false);
-
-  const availableMonths = useMemo(() => {
-    const set = new Set<string>(posts.map((p) => p.monthKey));
-    return Array.from(set).sort();
-  }, [posts]);
-
-  const monthScopedPosts = useMemo(() => {
-    if (selectedMonth === 'ALL') return posts;
-    return posts.filter((p) => p.monthKey === selectedMonth);
-  }, [posts, selectedMonth]);
-
-  const counts = useMemo(() => {
-    return {
-      all: monthScopedPosts.length,
-      pending: monthScopedPosts.filter((p) => p.status === 'PENDING').length,
-      posted: monthScopedPosts.filter((p) => p.status === 'POSTED').length,
-      failed: monthScopedPosts.filter((p) => p.status === 'FAILED').length,
-    };
-  }, [monthScopedPosts]);
-
-  const filteredPosts = useMemo(() => {
-    const q = searchQuery.trim().toLowerCase();
-    return monthScopedPosts
-      .filter((p) => {
-        if (activeTab !== 'ALL' && p.status !== activeTab) return false;
-        if (q) {
-          const hay = `${p.topicName} ${p.stageLabel} ${p.seoTitle} ${p.seoDescription} ${p.seoTags.join(' ')} ${p.fbPostId ?? ''}`.toLowerCase();
-          if (!hay.includes(q)) return false;
-        }
-        return true;
-      })
-      .sort(
-        (a, b) =>
-          new Date(a.scheduledAt).getTime() - new Date(b.scheduledAt).getTime()
-      );
-  }, [monthScopedPosts, activeTab, searchQuery]);
 
   const openEditor = (post: ScheduledPost) => {
     setEditingPost(post);
@@ -271,6 +349,18 @@ export const MonthlyScheduleTable: React.FC<MonthlyScheduleTableProps> = ({
     );
   };
 
+  const pageNumbers = useMemo(
+    () => buildPageNumbers(pagination.page, pagination.totalPages),
+    [pagination.page, pagination.totalPages]
+  );
+
+  const rangeStart =
+    pagination.totalItems === 0 ? 0 : (pagination.page - 1) * pagination.limit + 1;
+  const rangeEnd = Math.min(
+    pagination.page * pagination.limit,
+    pagination.totalItems
+  );
+
   return (
     <section
       id="table-section"
@@ -281,32 +371,58 @@ export const MonthlyScheduleTable: React.FC<MonthlyScheduleTableProps> = ({
       <div className="p-4 sm:p-5 border-b border-[#E4E6EB] space-y-4">
         <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
           <div>
-            <h2
-              id="table-heading"
-              className="font-display text-base sm:text-lg font-bold text-[#1C1E21]"
-            >
-              Publishing Queue &amp; Monthly Schedule
-            </h2>
+            <div className="flex items-center gap-2">
+              <h2
+                id="table-heading"
+                className="font-display text-base sm:text-lg font-bold text-[#1C1E21]"
+              >
+                Publishing Queue &amp; Monthly Schedule
+              </h2>
+              {isLoading && hasLoadedOnce && (
+                <Loader2
+                  className="w-3.5 h-3.5 animate-spin text-[#1877F2]"
+                  aria-label="Refreshing page"
+                />
+              )}
+            </div>
             <p className="text-xs text-[#65676B] mt-0.5">
-              Synced with PostgreSQL. Posts publish automatically at each recurring slot time.
+              Server-side PostgreSQL pagination across recurring daily publishing slots.
             </p>
           </div>
 
-          <button
-            type="button"
-            onClick={() => setIsAddOpen(true)}
-            className="inline-flex items-center justify-center gap-1.5 px-3.5 py-2 text-xs font-semibold text-white bg-[#1877F2] hover:bg-[#166FE5] rounded-lg whitespace-nowrap shrink-0 cursor-pointer min-h-[38px]"
-          >
-            <Plus className="w-3.5 h-3.5" />
-            <span>Add Post Row</span>
-          </button>
+          <div className="flex flex-wrap items-center gap-2">
+            {counts.failed > 0 && (
+              <button
+                type="button"
+                disabled={isRequeuingFailed}
+                onClick={() => void onRequeueFailed()}
+                className="inline-flex items-center justify-center gap-1.5 px-3 py-2 text-xs font-semibold text-amber-950 bg-amber-100 hover:bg-amber-200 border border-amber-300 disabled:opacity-60 rounded-lg whitespace-nowrap shrink-0 cursor-pointer min-h-[38px]"
+              >
+                {isRequeuingFailed ? (
+                  <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                ) : (
+                  <RotateCcw className="w-3.5 h-3.5" />
+                )}
+                <span>Re-queue Failed ({counts.failed})</span>
+              </button>
+            )}
+
+            <button
+              type="button"
+              onClick={() => setIsAddOpen(true)}
+              className="inline-flex items-center justify-center gap-1.5 px-3.5 py-2 text-xs font-semibold text-white bg-[#1877F2] hover:bg-[#166FE5] rounded-lg whitespace-nowrap shrink-0 cursor-pointer min-h-[38px]"
+            >
+              <Plus className="w-3.5 h-3.5" />
+              <span>Add Post Row</span>
+            </button>
+          </div>
         </div>
 
         <div className="flex flex-col xl:flex-row xl:items-center justify-between gap-3">
           <div
             role="tablist"
             aria-label="Filter schedule table by status"
-            className="inline-flex flex-wrap items-center gap-1 p-1 bg-[#F0F2F5] rounded-lg"
+            className="inline-flex flex-wrap items-center gap-1 p-1 bg-[#F0F2F5] rounded-lg self-start"
           >
             {(
               [
@@ -321,7 +437,10 @@ export const MonthlyScheduleTable: React.FC<MonthlyScheduleTableProps> = ({
                 type="button"
                 role="tab"
                 aria-selected={activeTab === tab.id}
-                onClick={() => setActiveTab(tab.id)}
+                onClick={() => {
+                  setActiveTab(tab.id);
+                  setPage(1);
+                }}
                 className={`px-3 py-1.5 text-xs font-medium rounded-md transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
                   activeTab === tab.id
                     ? 'bg-white text-[#1877F2] font-semibold shadow-xs'
@@ -336,14 +455,31 @@ export const MonthlyScheduleTable: React.FC<MonthlyScheduleTableProps> = ({
             ))}
           </div>
 
-          <div className="flex flex-col sm:flex-row items-stretch sm:items-center gap-2">
+          <div className="flex flex-col sm:flex-row flex-wrap items-stretch sm:items-center gap-2">
+            <select
+              aria-label="Sort schedule"
+              value={sortOrder}
+              onChange={(e) => {
+                setSortOrder(e.target.value as PostSortOrder);
+                setPage(1);
+              }}
+              className="px-3 py-2 text-xs text-[#1C1E21] bg-white border border-[#CCD0D5] rounded-lg focus:outline-none focus:border-[#1877F2]"
+            >
+              <option value="asc">Soonest First</option>
+              <option value="desc">Latest First</option>
+              <option value="updated">Recently Updated</option>
+            </select>
+
             <select
               aria-label="Filter by month"
               value={selectedMonth}
-              onChange={(e) => setSelectedMonth(e.target.value)}
+              onChange={(e) => {
+                setSelectedMonth(e.target.value);
+                setPage(1);
+              }}
               className="px-3 py-2 text-xs text-[#1C1E21] bg-white border border-[#CCD0D5] rounded-lg focus:outline-none focus:border-[#1877F2]"
             >
-              <option value="ALL">All Months ({posts.length})</option>
+              <option value="ALL">All Months</option>
               {availableMonths.map((mk) => (
                 <option key={mk} value={mk}>
                   {formatMonthLabel(mk)}
@@ -355,39 +491,57 @@ export const MonthlyScheduleTable: React.FC<MonthlyScheduleTableProps> = ({
               <Search className="w-3.5 h-3.5 text-[#65676B] absolute left-3 top-1/2 -translate-y-1/2 pointer-events-none" />
               <input
                 type="search"
-                value={searchQuery}
-                onChange={(e) => setSearchQuery(e.target.value)}
+                value={searchInput}
+                onChange={(e) => setSearchInput(e.target.value)}
                 placeholder="Search topic, title, FB ID..."
                 aria-label="Search schedule table"
-                className="w-full sm:w-56 pl-8 pr-3 py-2 text-xs text-[#1C1E21] bg-white border border-[#CCD0D5] rounded-lg focus:outline-none focus:border-[#1877F2]"
+                className="w-full sm:w-52 pl-8 pr-3 py-2 text-xs text-[#1C1E21] bg-white border border-[#CCD0D5] rounded-lg focus:outline-none focus:border-[#1877F2]"
               />
             </div>
           </div>
         </div>
+
+        {loadError && (
+          <div className="text-xs text-red-700 bg-red-50 border border-red-200 rounded-lg px-3 py-2 flex items-center justify-between gap-2">
+            <span>{loadError}</span>
+            <button
+              type="button"
+              onClick={() => void fetchPaginatedPosts()}
+              className="font-semibold underline cursor-pointer shrink-0"
+            >
+              Retry
+            </button>
+          </div>
+        )}
       </div>
 
-      {/* Empty State */}
-      {filteredPosts.length === 0 ? (
+      {/* Initial Loading / Empty State */}
+      {!hasLoadedOnce && isLoading ? (
+        <div className="p-12 text-center text-xs text-[#65676B] flex items-center justify-center gap-2">
+          <Loader2 className="w-4 h-4 animate-spin text-[#1877F2]" />
+          <span>Loading paginated schedule from PostgreSQL...</span>
+        </div>
+      ) : rows.length === 0 ? (
         <div className="p-10 sm:p-12 text-center">
           <div className="mx-auto w-11 h-11 rounded-full bg-[#F0F2F5] flex items-center justify-center text-[#65676B] mb-3">
             <Table2 className="w-5 h-5" />
           </div>
           <h3 className="font-display text-base font-bold text-[#1C1E21]">
-            {posts.length === 0
+            {counts.all === 0 && !debouncedSearch && selectedMonth === 'ALL'
               ? 'No monthly posts scheduled yet'
               : 'No rows match your current filter'}
           </h3>
           <p className="mt-1 text-xs text-[#65676B] max-w-md mx-auto">
-            {posts.length === 0
+            {counts.all === 0 && !debouncedSearch && selectedMonth === 'ALL'
               ? 'Use the Monthly Topic & Time-Slot Planner to generate a schedule, load the 30-Day ML Curriculum, or add a custom post.'
-              : 'Reset status tabs or search filters to view other scheduled posts.'}
+              : 'Reset status tabs, month filter, or search text to view other scheduled posts.'}
           </p>
         </div>
       ) : (
         <>
-          {/* Mobile & Small Screen Responsive Card Feed */}
-          <div className="md:hidden divide-y divide-[#E4E6EB]">
-            {filteredPosts.map((post) => {
+          {/* Mobile & Tablet Responsive Card Feed (< lg) */}
+          <div className="lg:hidden divide-y divide-[#E4E6EB]">
+            {rows.map((post) => {
               const isPublishing = publishingIds.has(post.id);
               const isRegenerating = regeneratingIds.has(post.id);
 
@@ -430,8 +584,15 @@ export const MonthlyScheduleTable: React.FC<MonthlyScheduleTableProps> = ({
                   </div>
 
                   {post.status === 'FAILED' && post.errorMessage && (
-                    <div className="text-xs text-red-700 bg-red-50 border border-red-200 rounded-lg px-2.5 py-1.5">
-                      {post.errorMessage}
+                    <div className="text-xs text-red-700 bg-red-50 border border-red-200 rounded-lg px-2.5 py-1.5 flex items-start justify-between gap-2">
+                      <span>{post.errorMessage}</span>
+                      <button
+                        type="button"
+                        onClick={() => void onUpdatePost(post.id, { status: 'PENDING' })}
+                        className="font-semibold text-[#1877F2] hover:underline shrink-0 cursor-pointer"
+                      >
+                        Re-queue
+                      </button>
                     </div>
                   )}
 
@@ -534,21 +695,20 @@ export const MonthlyScheduleTable: React.FC<MonthlyScheduleTableProps> = ({
             })}
           </div>
 
-          {/* Desktop High-Density Table */}
-          <div className="hidden md:block overflow-x-auto">
-            <table className="w-full text-left border-collapse">
+          {/* Desktop 5-Column Zero-Overflow Table (lg+) */}
+          <div className="hidden lg:block overflow-x-auto">
+            <table className="w-full text-left border-collapse table-fixed">
               <thead>
                 <tr className="bg-[#F7F8FA] border-b border-[#E4E6EB] text-[11px] font-semibold text-[#65676B] tracking-wide">
-                  <th className="py-3 px-4 whitespace-nowrap">Schedule &amp; Slot</th>
-                  <th className="py-3 px-4 whitespace-nowrap">Topic</th>
-                  <th className="py-3 px-4">Headline &amp; Post Body</th>
-                  <th className="py-3 px-4 whitespace-nowrap">Status</th>
-                  <th className="py-3 px-4 whitespace-nowrap">Published At &amp; FB ID</th>
-                  <th className="py-3 px-4 text-right whitespace-nowrap">Actions</th>
+                  <th className="py-3 px-4 w-[132px] whitespace-nowrap">Schedule &amp; Slot</th>
+                  <th className="py-3 px-4">Topic &amp; Post Copy</th>
+                  <th className="py-3 px-3 w-[108px] whitespace-nowrap">Status</th>
+                  <th className="py-3 px-3 w-[160px] whitespace-nowrap">Published / FB</th>
+                  <th className="py-3 px-4 w-[178px] text-right whitespace-nowrap">Actions</th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-[#E4E6EB] text-xs">
-                {filteredPosts.map((post) => {
+                {rows.map((post) => {
                   const isPublishing = publishingIds.has(post.id);
                   const isRegenerating = regeneratingIds.has(post.id);
 
@@ -566,55 +726,63 @@ export const MonthlyScheduleTable: React.FC<MonthlyScheduleTableProps> = ({
                         </div>
                       </td>
 
-                      <td className="py-3.5 px-4 max-w-[190px]">
-                        <div className="font-semibold text-[#1C1E21] line-clamp-2">
-                          {post.topicName}
+                      <td className="py-3.5 px-4 min-w-0">
+                        <div className="flex items-center gap-1.5 text-[11px] text-[#65676B] truncate">
+                          <span className="font-semibold text-[#1C1E21] truncate">
+                            {post.topicName}
+                          </span>
+                          <span aria-hidden="true">·</span>
+                          <span className="truncate">{post.stageLabel}</span>
                         </div>
-                        <div className="mt-0.5 text-[11px] text-[#65676B] truncate">
-                          {post.stageLabel}
-                        </div>
-                      </td>
 
-                      <td className="py-3.5 px-4 min-w-[260px] max-w-[400px]">
                         <button
                           type="button"
                           onClick={() => openEditor(post)}
-                          className="text-left group cursor-pointer"
+                          className="mt-0.5 text-left group cursor-pointer block w-full"
                         >
-                          <div className="font-semibold text-[#1C1E21] group-hover:text-[#1877F2] transition-colors line-clamp-1">
+                          <div className="font-semibold text-[#1C1E21] group-hover:text-[#1877F2] transition-colors truncate">
                             {post.seoTitle}
                           </div>
                           <p className="mt-0.5 text-[#65676B] line-clamp-2 leading-relaxed">
                             {post.seoDescription}
                           </p>
                         </button>
+
                         {post.seoTags.length > 0 && (
                           <div className="mt-1.5 flex flex-wrap gap-x-2 gap-y-0.5 font-mono text-[11px] text-[#1877F2]">
-                            {post.seoTags.map((t) => (
+                            {post.seoTags.slice(0, 4).map((t) => (
                               <span key={t}>{t}</span>
                             ))}
                           </div>
                         )}
+
                         {post.status === 'FAILED' && post.errorMessage && (
-                          <div className="mt-1.5 text-[11px] text-red-700 bg-red-50 border border-red-200 rounded-md px-2 py-1">
-                            {post.errorMessage}
+                          <div className="mt-1.5 text-[11px] text-red-700 bg-red-50 border border-red-200 rounded-md px-2.5 py-1 flex items-start justify-between gap-2">
+                            <span className="line-clamp-2">{post.errorMessage}</span>
+                            <button
+                              type="button"
+                              onClick={() => void onUpdatePost(post.id, { status: 'PENDING' })}
+                              className="font-semibold text-[#1877F2] hover:underline shrink-0 cursor-pointer"
+                            >
+                              Re-queue
+                            </button>
                           </div>
                         )}
                       </td>
 
-                      <td className="py-3.5 px-4 whitespace-nowrap">
+                      <td className="py-3.5 px-3 whitespace-nowrap">
                         {renderStatusIndicator(post)}
                       </td>
 
-                      <td className="py-3.5 px-4 whitespace-nowrap">
+                      <td className="py-3.5 px-3 whitespace-nowrap">
                         {post.status === 'POSTED' && post.publishedAt ? (
                           <div>
-                            <div className="font-mono tabular-nums text-[#1C1E21]">
+                            <div className="font-mono tabular-nums text-[11px] text-[#1C1E21]">
                               {formatDateTimeDisplay(post.publishedAt)}
                             </div>
                             {post.isSimulated ? (
                               <div className="mt-0.5 flex items-center gap-2 text-[11px] text-amber-700">
-                                <span>Dry Run (not on FB)</span>
+                                <span>Dry Run</span>
                                 <button
                                   type="button"
                                   onClick={() =>
@@ -633,10 +801,11 @@ export const MonthlyScheduleTable: React.FC<MonthlyScheduleTableProps> = ({
                                   href={`https://www.facebook.com/${encodeURIComponent(post.fbPostId)}`}
                                   target="_blank"
                                   rel="noreferrer"
-                                  className="mt-0.5 inline-flex items-center gap-1 font-mono tabular-nums text-[11px] text-emerald-700 hover:underline"
+                                  title={post.fbPostId}
+                                  className="mt-0.5 inline-flex items-center gap-1 font-mono tabular-nums text-[11px] text-emerald-700 hover:underline max-w-[144px] truncate"
                                 >
-                                  <span>{post.fbPostId}</span>
-                                  <ExternalLink className="w-3 h-3" />
+                                  <span className="truncate">{post.fbPostId}</span>
+                                  <ExternalLink className="w-3 h-3 shrink-0" />
                                 </a>
                               )
                             )}
@@ -647,7 +816,7 @@ export const MonthlyScheduleTable: React.FC<MonthlyScheduleTableProps> = ({
                       </td>
 
                       <td className="py-3.5 px-4 text-right whitespace-nowrap">
-                        <div className="inline-flex items-center justify-end gap-1.5">
+                        <div className="inline-flex items-center justify-end gap-1">
                           <button
                             type="button"
                             disabled={isPublishing || isRegenerating}
@@ -728,6 +897,111 @@ export const MonthlyScheduleTable: React.FC<MonthlyScheduleTableProps> = ({
           </div>
         </>
       )}
+
+      {/* Server-Side Pagination Footer */}
+      <div className="px-4 sm:px-5 py-3.5 bg-[#F7F8FA] border-t border-[#E4E6EB] flex flex-col sm:flex-row sm:items-center justify-between gap-3 text-xs">
+        <div className="flex flex-wrap items-center gap-3 text-[#65676B]">
+          <span className="font-mono tabular-nums">
+            Showing <strong className="text-[#1C1E21]">{rangeStart}</strong>–
+            <strong className="text-[#1C1E21]">{rangeEnd}</strong> of{' '}
+            <strong className="text-[#1C1E21]">{pagination.totalItems}</strong>
+          </span>
+
+          <label className="inline-flex items-center gap-1.5">
+            <span>Rows:</span>
+            <select
+              aria-label="Rows per page"
+              value={limit}
+              onChange={(e) => {
+                setLimit(Number(e.target.value));
+                setPage(1);
+              }}
+              className="px-2 py-1 text-xs font-mono tabular-nums text-[#1C1E21] bg-white border border-[#CCD0D5] rounded-md focus:outline-none focus:border-[#1877F2]"
+            >
+              {PAGE_SIZE_OPTIONS.map((opt) => (
+                <option key={opt} value={opt}>
+                  {opt}
+                </option>
+              ))}
+            </select>
+          </label>
+        </div>
+
+        <nav
+          aria-label="Schedule pagination"
+          className="flex items-center justify-between sm:justify-end gap-1"
+        >
+          <button
+            type="button"
+            disabled={!pagination.hasPrevPage || isLoading}
+            onClick={() => setPage(1)}
+            aria-label="First page"
+            className="p-1.5 text-[#1C1E21] bg-white border border-[#CCD0D5] hover:bg-[#F0F2F5] disabled:opacity-40 rounded-md cursor-pointer"
+          >
+            <ChevronsLeft className="w-3.5 h-3.5" />
+          </button>
+          <button
+            type="button"
+            disabled={!pagination.hasPrevPage || isLoading}
+            onClick={() => setPage((p) => Math.max(1, p - 1))}
+            aria-label="Previous page"
+            className="inline-flex items-center gap-1 px-2.5 py-1.5 text-[#1C1E21] bg-white border border-[#CCD0D5] hover:bg-[#F0F2F5] disabled:opacity-40 rounded-md cursor-pointer"
+          >
+            <ChevronLeft className="w-3.5 h-3.5" />
+            <span className="hidden sm:inline font-medium">Prev</span>
+          </button>
+
+          <span className="sm:hidden font-mono tabular-nums px-2 text-[#65676B]">
+            Page <strong className="text-[#1C1E21]">{pagination.page}</strong> /{' '}
+            {pagination.totalPages}
+          </span>
+
+          <div className="hidden sm:inline-flex items-center gap-1">
+            {pageNumbers.map((item, idx) =>
+              item === 'ellipsis' ? (
+                <span key={`e-${idx}`} className="px-1.5 text-[#65676B]">
+                  …
+                </span>
+              ) : (
+                <button
+                  key={item}
+                  type="button"
+                  disabled={isLoading}
+                  onClick={() => setPage(item)}
+                  aria-current={item === pagination.page ? 'page' : undefined}
+                  className={`min-w-[30px] h-[30px] px-2 font-mono tabular-nums text-xs rounded-md border transition-colors cursor-pointer ${
+                    item === pagination.page
+                      ? 'bg-[#1877F2] border-[#1877F2] text-white font-semibold'
+                      : 'bg-white border-[#CCD0D5] text-[#1C1E21] hover:bg-[#F0F2F5]'
+                  }`}
+                >
+                  {item}
+                </button>
+              )
+            )}
+          </div>
+
+          <button
+            type="button"
+            disabled={!pagination.hasNextPage || isLoading}
+            onClick={() => setPage((p) => Math.min(pagination.totalPages, p + 1))}
+            aria-label="Next page"
+            className="inline-flex items-center gap-1 px-2.5 py-1.5 text-[#1C1E21] bg-white border border-[#CCD0D5] hover:bg-[#F0F2F5] disabled:opacity-40 rounded-md cursor-pointer"
+          >
+            <span className="hidden sm:inline font-medium">Next</span>
+            <ChevronRight className="w-3.5 h-3.5" />
+          </button>
+          <button
+            type="button"
+            disabled={!pagination.hasNextPage || isLoading}
+            onClick={() => setPage(pagination.totalPages)}
+            aria-label="Last page"
+            className="p-1.5 text-[#1C1E21] bg-white border border-[#CCD0D5] hover:bg-[#F0F2F5] disabled:opacity-40 rounded-md cursor-pointer"
+          >
+            <ChevronsRight className="w-3.5 h-3.5" />
+          </button>
+        </nav>
+      </div>
 
       {/* Edit & Live Facebook Feed Preview Modal */}
       {editingPost && (

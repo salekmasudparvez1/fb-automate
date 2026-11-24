@@ -21,6 +21,13 @@ export interface ScheduledPost {
   updatedAt: string;
 }
 
+export interface FacebookTokenStatus {
+  hasPermanentStoredToken: boolean;
+  expiresLabel: string | null;
+  tokenErrorNotice: string | null;
+  hasAppCredentials: boolean;
+}
+
 export interface PublisherSettings {
   facebookPageId: string;
   hasAccessToken: boolean;
@@ -28,6 +35,31 @@ export interface PublisherSettings {
   autoPublishEnabled: boolean;
   dryRunMode: boolean;
   recurringTimes: string[];
+  tokenStatus?: FacebookTokenStatus;
+}
+
+export type PostSortOrder = 'asc' | 'desc' | 'updated';
+
+export interface PaginationMeta {
+  page: number;
+  limit: number;
+  totalItems: number;
+  totalPages: number;
+  hasNextPage: boolean;
+  hasPrevPage: boolean;
+}
+
+export interface PaginatedPostsResponse {
+  posts: ScheduledPost[];
+  pagination: PaginationMeta;
+  counts: {
+    all: number;
+    pending: number;
+    posted: number;
+    simulated: number;
+    failed: number;
+  };
+  availableMonths: string[];
 }
 
 export type ActivityLevel = 'info' | 'success' | 'warning' | 'error';

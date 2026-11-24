@@ -7,6 +7,7 @@ import {
   Loader2,
   Play,
   Radio,
+  RotateCcw,
   Send,
   SlidersHorizontal,
   Wifi,
@@ -21,6 +22,7 @@ import { ActivityConsole } from './components/ActivityConsole';
 import { FacebookFeedPreview } from './components/FacebookFeedPreview';
 import {
   SettingsModal,
+  type FacebookExchangeResult,
   type FacebookVerifyResult,
 } from './components/SettingsModal';
 import { SecurityModal } from './components/SecurityModal';
@@ -78,6 +80,8 @@ export default function App() {
   const [generatorError, setGeneratorError] = useState<string | null>(null);
   const [publishingIds, setPublishingIds] = useState<Set<string>>(() => new Set());
   const [regeneratingIds, setRegeneratingIds] = useState<Set<string>>(() => new Set());
+  const [isRequeuingFailed, setIsRequeuingFailed] = useState<boolean>(false);
+  const [tableRefreshKey, setTableRefreshKey] = useState<number>(0);
   const [isSettingsOpen, setIsSettingsOpen] = useState<boolean>(false);
   const [isSecurityOpen, setIsSecurityOpen] = useState<boolean>(false);
 
@@ -249,6 +253,7 @@ export default function App() {
         scheduler?: SchedulerStatus;
       }>('/api/sync');
       setPosts(state.posts || []);
+      setTableRefreshKey((n) => n + 1);
       if (state.settings) setSettings(state.settings);
       setLogs(state.logs || []);
       if (state.scheduler) setScheduler(state.scheduler);
@@ -335,6 +340,7 @@ export default function App() {
               setSocketConnected(true);
               setSyncMode('websocket');
               setPosts(payload.posts || []);
+              setTableRefreshKey((n) => n + 1);
               if (payload.settings) setSettings(payload.settings);
               setLogs(payload.logs || []);
               if (payload.scheduler) setScheduler(payload.scheduler);
@@ -345,6 +351,7 @@ export default function App() {
               setPosts((prev) =>
                 prev.some((p) => p.id === created.id) ? prev : [...prev, created]
               );
+              setTableRefreshKey((n) => n + 1);
               break;
             }
             case 'posts:bulk_created': {
@@ -354,6 +361,7 @@ export default function App() {
                 const additions = batch.filter((p) => !existingIds.has(p.id));
                 return [...prev, ...additions];
               });
+              setTableRefreshKey((n) => n + 1);
               break;
             }
             case 'post:updated': {
@@ -361,17 +369,20 @@ export default function App() {
               setPosts((prev) =>
                 prev.map((p) => (p.id === updated.id ? updated : p))
               );
+              setTableRefreshKey((n) => n + 1);
               break;
             }
             case 'posts:bulk_updated': {
               const batch = msg.data as ScheduledPost[];
               const byId = new Map(batch.map((p) => [p.id, p]));
               setPosts((prev) => prev.map((p) => byId.get(p.id) ?? p));
+              setTableRefreshKey((n) => n + 1);
               break;
             }
             case 'post:deleted': {
               const { id } = msg.data as { id: string };
               setPosts((prev) => prev.filter((p) => p.id !== id));
+              setTableRefreshKey((n) => n + 1);
               break;
             }
             case 'settings:updated': {
@@ -515,9 +526,45 @@ export default function App() {
   };
 
   const handleVerifyFacebookConnection = async () => {
-    return apiFetch<FacebookVerifyResult>('/api/facebook/verify', {
+    const res = await apiFetch<FacebookVerifyResult>('/api/facebook/verify', {
       method: 'POST',
     });
+    if (!socketConnected) void refreshWorkspaceViaRest();
+    return res;
+  };
+
+  const handleExchangeFacebookToken = async (shortLivedToken?: string) => {
+    const res = await apiFetch<FacebookExchangeResult>(
+      '/api/facebook/exchange-token',
+      {
+        method: 'POST',
+        body: JSON.stringify(
+          shortLivedToken ? { shortLivedToken } : {}
+        ),
+      }
+    );
+    if (res.settings) {
+      setSettings(res.settings);
+    }
+    return res;
+  };
+
+  const handleRequeueFailed = async () => {
+    setIsRequeuingFailed(true);
+    try {
+      const res = await apiFetch<{ count: number; posts: ScheduledPost[] }>(
+        '/api/posts/requeue-failed',
+        { method: 'POST' }
+      );
+      if (res.posts?.length) {
+        const byId = new Map(res.posts.map((p) => [p.id, p]));
+        setPosts((prev) => prev.map((p) => byId.get(p.id) ?? p));
+      }
+      setTableRefreshKey((n) => n + 1);
+      if (!socketConnected) void refreshWorkspaceViaRest();
+    } finally {
+      setIsRequeuingFailed(false);
+    }
   };
 
   const handleApplySlotsToPending = async () => {
@@ -537,6 +584,7 @@ export default function App() {
         const byId = new Map(res.posts.map((p) => [p.id, p]));
         setPosts((prev) => prev.map((p) => byId.get(p.id) ?? p));
       }
+      setTableRefreshKey((n) => n + 1);
       if (!socketConnected) void refreshWorkspaceViaRest();
     } finally {
       setIsApplyingSlots(false);
@@ -563,6 +611,7 @@ export default function App() {
           return [...prev, ...additions];
         });
       }
+      setTableRefreshKey((n) => n + 1);
       if (!socketConnected) void refreshWorkspaceViaRest();
     } catch (err: unknown) {
       setGeneratorError(
@@ -598,6 +647,7 @@ export default function App() {
         ...prev,
         recurringTimes: ['09:00', '15:00', '18:00'],
       }));
+      setTableRefreshKey((n) => n + 1);
       if (!socketConnected) void refreshWorkspaceViaRest();
     } catch (err: unknown) {
       setGeneratorError(
@@ -627,6 +677,7 @@ export default function App() {
         prev.some((p) => p.id === res.post.id) ? prev : [...prev, res.post]
       );
     }
+    setTableRefreshKey((n) => n + 1);
     if (!socketConnected) void refreshWorkspaceViaRest();
   };
 
@@ -651,6 +702,7 @@ export default function App() {
     if (res.post) {
       setPosts((prev) => prev.map((p) => (p.id === res.post.id ? res.post : p)));
     }
+    setTableRefreshKey((n) => n + 1);
     if (!socketConnected) void refreshWorkspaceViaRest();
   };
 
@@ -669,8 +721,9 @@ export default function App() {
         setPosts((prev) => prev.map((p) => (p.id === res.post.id ? res.post : p)));
       }
     } catch {
-      // Server persists FAILED status
+      // Server persists FAILED status or pauses auto-publish on expired token
     } finally {
+      setTableRefreshKey((n) => n + 1);
       if (!socketConnected) void refreshWorkspaceViaRest();
       setPublishingIds((prev) => {
         const next = new Set(prev);
@@ -694,6 +747,7 @@ export default function App() {
       if (res.post) {
         setPosts((prev) => prev.map((p) => (p.id === res.post.id ? res.post : p)));
       }
+      setTableRefreshKey((n) => n + 1);
       if (!socketConnected) void refreshWorkspaceViaRest();
     } finally {
       setRegeneratingIds((prev) => {
@@ -709,6 +763,7 @@ export default function App() {
       method: 'DELETE',
     });
     setPosts((prev) => prev.filter((p) => p.id !== id));
+    setTableRefreshKey((n) => n + 1);
     if (!socketConnected) void refreshWorkspaceViaRest();
   };
 
@@ -929,6 +984,43 @@ export default function App() {
 
         {/* Main Viewport */}
         <main className="flex-1 max-w-[1440px] w-full mx-auto px-4 sm:px-6 lg:px-8 py-5 sm:py-6 space-y-5 sm:space-y-6">
+          {/* Expired Facebook Token Recovery Banner */}
+          {settings.tokenStatus?.tokenErrorNotice && (
+            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 px-4 py-3.5 bg-red-50 border border-red-200 rounded-xl text-xs text-red-950">
+              <div className="flex items-start gap-2.5">
+                <AlertTriangle className="w-4 h-4 text-red-600 shrink-0 mt-0.5" />
+                <div>
+                  <div className="font-semibold">
+                    Facebook Access Token Expired — Auto-Publish Paused Safely
+                  </div>
+                  <div className="mt-0.5 text-red-900 leading-relaxed">
+                    {settings.tokenStatus.tokenErrorNotice}
+                  </div>
+                </div>
+              </div>
+              <div className="flex flex-wrap items-center gap-2 shrink-0">
+                {counts.failed > 0 && (
+                  <button
+                    type="button"
+                    disabled={isRequeuingFailed}
+                    onClick={() => void handleRequeueFailed()}
+                    className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold text-red-950 bg-white border border-red-300 hover:bg-red-100 rounded-lg whitespace-nowrap cursor-pointer"
+                  >
+                    <RotateCcw className="w-3.5 h-3.5" />
+                    <span>Re-queue Failed ({counts.failed})</span>
+                  </button>
+                )}
+                <button
+                  type="button"
+                  onClick={() => setIsSettingsOpen(true)}
+                  className="px-3 py-1.5 text-xs font-semibold text-white bg-red-600 hover:bg-red-700 rounded-lg whitespace-nowrap cursor-pointer"
+                >
+                  Renew / Upgrade Token
+                </button>
+              </div>
+            </div>
+          )}
+
           {/* Actionable Status Notice when Dry Run is ON or Secrets Missing */}
           {(settings.dryRunMode || !settings.facebookPageId || !settings.hasAccessToken) && (
             <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 px-4 py-3 bg-amber-50 border border-amber-200 rounded-xl text-xs text-amber-950">
@@ -1146,7 +1238,8 @@ export default function App() {
 
                 <div className="xl:col-span-8">
                   <MonthlyScheduleTable
-                    posts={posts}
+                    apiFetch={apiFetch}
+                    refreshKey={tableRefreshKey}
                     recurringTimes={settings.recurringTimes}
                     publishingIds={publishingIds}
                     regeneratingIds={regeneratingIds}
@@ -1154,6 +1247,8 @@ export default function App() {
                     pageName={pageLabel}
                     initialFilter={tableInitialFilter}
                     externalAddTrigger={addPostTrigger}
+                    isRequeuingFailed={isRequeuingFailed}
+                    onRequeueFailed={handleRequeueFailed}
                     onAddManualPost={handleAddManualPost}
                     onUpdatePost={handleUpdatePost}
                     onPublishNow={handlePublishNow}
@@ -1168,7 +1263,8 @@ export default function App() {
           {/* FULL SCHEDULE TABLE VIEW */}
           {activeView === 'schedule' && (
             <MonthlyScheduleTable
-              posts={posts}
+              apiFetch={apiFetch}
+              refreshKey={tableRefreshKey}
               recurringTimes={settings.recurringTimes}
               publishingIds={publishingIds}
               regeneratingIds={regeneratingIds}
@@ -1176,6 +1272,8 @@ export default function App() {
               pageName={pageLabel}
               initialFilter={tableInitialFilter}
               externalAddTrigger={addPostTrigger}
+              isRequeuingFailed={isRequeuingFailed}
+              onRequeueFailed={handleRequeueFailed}
               onAddManualPost={handleAddManualPost}
               onUpdatePost={handleUpdatePost}
               onPublishNow={handlePublishNow}
@@ -1311,6 +1409,7 @@ export default function App() {
         settings={settings}
         onClose={() => setIsSettingsOpen(false)}
         onVerifyConnection={handleVerifyFacebookConnection}
+        onExchangeToken={handleExchangeFacebookToken}
         onSave={handleSaveSettings}
       />
 
