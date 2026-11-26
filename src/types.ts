@@ -1,4 +1,5 @@
 export type PostStatus = 'PENDING' | 'POSTED' | 'FAILED';
+export type MediaType = 'none' | 'image' | 'video';
 
 export interface ScheduledPost {
   id: string;
@@ -10,6 +11,9 @@ export interface ScheduledPost {
   seoTitle: string;
   seoDescription: string;
   seoTags: string[];
+  mediaType: MediaType;
+  mediaUrl?: string;
+  mediaPublicId?: string;
   slotTime: string;
   scheduledAt: string;
   status: PostStatus;
@@ -28,6 +32,12 @@ export interface FacebookTokenStatus {
   hasAppCredentials: boolean;
 }
 
+export interface CloudinaryMediaConfig {
+  configured: boolean;
+  cloudName: string;
+  maskedApiKey: string;
+}
+
 export interface PublisherSettings {
   facebookPageId: string;
   hasAccessToken: boolean;
@@ -36,6 +46,21 @@ export interface PublisherSettings {
   dryRunMode: boolean;
   recurringTimes: string[];
   tokenStatus?: FacebookTokenStatus;
+  mediaConfig?: CloudinaryMediaConfig;
+}
+
+export interface BulkImportRowPayload {
+  topicName: string;
+  stageLabel: string;
+  seoTitle: string;
+  seoDescription: string;
+  seoTags: string[];
+  mediaType: MediaType;
+  mediaUrl?: string;
+  slotTime: string;
+  scheduledAt: string;
+  monthKey: string;
+  warnings: string[];
 }
 
 export type PostSortOrder = 'asc' | 'desc' | 'updated';

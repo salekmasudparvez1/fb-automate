@@ -3,7 +3,10 @@ import {
   AlertTriangle,
   ArrowRight,
   Clock,
+  FileSpreadsheet,
+  Film,
   FlaskConical,
+  Image as ImageIcon,
   Loader2,
   Play,
   Radio,
@@ -20,6 +23,7 @@ import { MonthlyPlannerPanel } from './components/MonthlyPlannerPanel';
 import { MonthlyScheduleTable } from './components/MonthlyScheduleTable';
 import { ActivityConsole } from './components/ActivityConsole';
 import { FacebookFeedPreview } from './components/FacebookFeedPreview';
+import { BulkImportModal } from './components/BulkImportModal';
 import {
   SettingsModal,
   type FacebookExchangeResult,
@@ -29,6 +33,8 @@ import { SecurityModal } from './components/SecurityModal';
 import type {
   ActivityLogEntry,
   AuthStatus,
+  BulkImportRowPayload,
+  MediaType,
   PublisherSettings,
   QueueFilter,
   ScheduledPost,
@@ -84,6 +90,7 @@ export default function App() {
   const [tableRefreshKey, setTableRefreshKey] = useState<number>(0);
   const [isSettingsOpen, setIsSettingsOpen] = useState<boolean>(false);
   const [isSecurityOpen, setIsSecurityOpen] = useState<boolean>(false);
+  const [isBulkImportOpen, setIsBulkImportOpen] = useState<boolean>(false);
 
   const wsRef = useRef<WebSocket | null>(null);
   const reconnectTimerRef = useRef<number | null>(null);
@@ -668,6 +675,9 @@ export default function App() {
     seoTitle: string;
     seoDescription: string;
     seoTags: string[];
+    mediaType: MediaType;
+    mediaUrl?: string;
+    mediaPublicId?: string;
     slotTime: string;
     scheduledAt: string;
     monthKey: string;
@@ -685,6 +695,28 @@ export default function App() {
     if (!socketConnected) void refreshWorkspaceViaRest();
   };
 
+  const handleBulkImportPosts = async (
+    rows: BulkImportRowPayload[]
+  ): Promise<number> => {
+    const res = await apiFetch<{ posts: ScheduledPost[]; count: number }>(
+      '/api/posts/bulk-import',
+      {
+        method: 'POST',
+        body: JSON.stringify({ rows }),
+      }
+    );
+    if (res.posts?.length) {
+      setPosts((prev) => {
+        const existingIds = new Set(prev.map((p) => p.id));
+        const additions = res.posts.filter((p) => !existingIds.has(p.id));
+        return [...prev, ...additions];
+      });
+    }
+    setTableRefreshKey((n) => n + 1);
+    if (!socketConnected) void refreshWorkspaceViaRest();
+    return res.count ?? res.posts?.length ?? 0;
+  };
+
   const handleUpdatePost = async (
     id: string,
     updates: {
@@ -693,6 +725,9 @@ export default function App() {
       seoTitle?: string;
       seoDescription?: string;
       seoTags?: string[];
+      mediaType?: MediaType;
+      mediaUrl?: string;
+      mediaPublicId?: string;
       slotTime?: string;
       scheduledAt?: string;
       monthKey?: string;
@@ -977,6 +1012,15 @@ export default function App() {
 
               <button
                 type="button"
+                onClick={() => setIsBulkImportOpen(true)}
+                className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold text-[#1877F2] bg-[#E7F3FF] hover:bg-[#DCEBFF] rounded-lg whitespace-nowrap cursor-pointer"
+              >
+                <FileSpreadsheet className="w-3.5 h-3.5" />
+                <span>Import Excel / Sheet</span>
+              </button>
+
+              <button
+                type="button"
                 onClick={() => setIsSettingsOpen(true)}
                 className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold text-[#1C1E21] bg-white hover:bg-[#F0F2F5] border border-[#CCD0D5] rounded-lg whitespace-nowrap cursor-pointer"
               >
@@ -1071,12 +1115,12 @@ export default function App() {
               {/* 4-Column Interactive KPI Strip */}
               <section
                 aria-label="Publishing overview metrics"
-                className="bg-white border border-[#E4E6EB] rounded-xl grid grid-cols-2 lg:grid-cols-4 divide-y lg:divide-y-0 lg:divide-x divide-[#E4E6EB]"
+                className="bg-white border border-[#E4E6EB] rounded-xl grid grid-cols-2 lg:grid-cols-4 overflow-hidden"
               >
                 <button
                   type="button"
                   onClick={() => jumpToScheduleFilter('ALL')}
-                  className="p-4 sm:p-5 text-left hover:bg-[#F7F8FA] transition-colors cursor-pointer first:rounded-tl-xl lg:first:rounded-l-xl"
+                  className="p-4 sm:p-5 text-left hover:bg-[#F7F8FA] transition-colors cursor-pointer border-b lg:border-b-0 border-[#E4E6EB]"
                 >
                   <div className="text-xs font-medium text-[#65676B]">
                     Total Scheduled
@@ -1092,7 +1136,7 @@ export default function App() {
                 <button
                   type="button"
                   onClick={() => jumpToScheduleFilter('PENDING')}
-                  className="p-4 sm:p-5 text-left hover:bg-[#F7F8FA] transition-colors cursor-pointer border-l border-[#E4E6EB] lg:border-l-0"
+                  className="p-4 sm:p-5 text-left hover:bg-[#F7F8FA] transition-colors cursor-pointer border-l border-b lg:border-b-0 border-[#E4E6EB]"
                 >
                   <div className="text-xs font-medium text-[#65676B]">
                     Pending Queue
@@ -1108,7 +1152,7 @@ export default function App() {
                 <button
                   type="button"
                   onClick={() => jumpToScheduleFilter('POSTED')}
-                  className="p-4 sm:p-5 text-left hover:bg-[#F7F8FA] transition-colors cursor-pointer"
+                  className="p-4 sm:p-5 text-left hover:bg-[#F7F8FA] transition-colors cursor-pointer lg:border-l border-[#E4E6EB]"
                 >
                   <div className="text-xs font-medium text-[#65676B]">
                     Published to FB
@@ -1129,7 +1173,7 @@ export default function App() {
                 <button
                   type="button"
                   onClick={() => jumpToScheduleFilter('FAILED')}
-                  className="p-4 sm:p-5 text-left hover:bg-[#F7F8FA] transition-colors cursor-pointer border-l border-[#E4E6EB] lg:border-l-0 last:rounded-br-xl lg:last:rounded-r-xl"
+                  className="p-4 sm:p-5 text-left hover:bg-[#F7F8FA] transition-colors cursor-pointer border-l border-[#E4E6EB]"
                 >
                   <div className="text-xs font-medium text-[#65676B]">
                     Failed
@@ -1171,19 +1215,31 @@ export default function App() {
                       return (
                         <div
                           key={post.id}
-                          className="p-3.5 bg-[#F7F8FA] border border-[#E4E6EB] rounded-xl flex flex-col justify-between gap-3"
+                          className="p-3.5 bg-[#F7F8FA] border border-[#E4E6EB] rounded-xl flex flex-col justify-between gap-3 min-w-0"
                         >
-                          <div className="space-y-1.5">
+                          <div className="space-y-1.5 min-w-0">
                             <div className="flex items-center justify-between gap-2 text-[11px] font-mono tabular-nums">
-                              <span className="inline-flex items-center gap-1 font-semibold text-[#1877F2]">
-                                <Clock className="w-3 h-3" />
+                              <span className="inline-flex items-center gap-1 font-semibold text-[#1877F2] truncate">
+                                <Clock className="w-3 h-3 shrink-0" />
                                 {formatDateOnly(post.scheduledAt)} · {formatTime12h(post.slotTime)}
                               </span>
+                              {post.mediaType === 'image' && (
+                                <span className="inline-flex items-center gap-1 text-[#65676B] shrink-0">
+                                  <ImageIcon className="w-3 h-3 text-[#1877F2]" />
+                                  <span>Image</span>
+                                </span>
+                              )}
+                              {post.mediaType === 'video' && (
+                                <span className="inline-flex items-center gap-1 text-[#65676B] shrink-0">
+                                  <Film className="w-3 h-3 text-[#1877F2]" />
+                                  <span>Video</span>
+                                </span>
+                              )}
                             </div>
                             <div className="text-xs font-medium text-[#65676B] truncate">
                               {post.topicName}
                             </div>
-                            <div className="font-display text-sm font-bold text-[#1C1E21] line-clamp-2">
+                            <div className="font-display text-sm font-bold text-[#1C1E21] line-clamp-2 break-words">
                               {post.seoTitle}
                             </div>
                           </div>
@@ -1200,7 +1256,7 @@ export default function App() {
                               type="button"
                               disabled={isPublishing}
                               onClick={() => void handlePublishNow(post.id)}
-                              className="inline-flex items-center gap-1 px-2.5 py-1.5 text-xs font-semibold text-white bg-[#1877F2] hover:bg-[#166FE5] disabled:opacity-60 rounded-lg cursor-pointer"
+                              className="inline-flex items-center gap-1 px-2.5 py-1.5 text-xs font-semibold text-white bg-[#1877F2] hover:bg-[#166FE5] disabled:opacity-60 rounded-lg cursor-pointer shrink-0"
                             >
                               {isPublishing ? (
                                 <Loader2 className="w-3 h-3 animate-spin" />
@@ -1217,9 +1273,9 @@ export default function App() {
                 </section>
               )}
 
-              {/* Split Overview Studio: Planner + Activity on Left, Schedule Table on Right */}
-              <div className="grid grid-cols-1 xl:grid-cols-12 gap-6 items-start">
-                <div className="xl:col-span-4 space-y-6">
+              {/* Planner + Live Activity Row (Comfortable 7/5 Split) */}
+              <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-start">
+                <div className="lg:col-span-7 min-w-0">
                   <MonthlyPlannerPanel
                     recurringTimes={settings.recurringTimes}
                     pendingCount={counts.pending}
@@ -1234,33 +1290,39 @@ export default function App() {
                     onSeedMlMonth={handleSeedMlMonth}
                     onGenerateMonthly={handleGenerateMonthly}
                   />
+                </div>
 
+                <div className="lg:col-span-5 min-w-0">
                   <ActivityConsole
                     logs={logs}
                     onClearLogs={() => void handleClearLogs()}
+                    expanded
                   />
                 </div>
+              </div>
 
-                <div className="xl:col-span-8">
-                  <MonthlyScheduleTable
-                    apiFetch={apiFetch}
-                    refreshKey={tableRefreshKey}
-                    recurringTimes={settings.recurringTimes}
-                    publishingIds={publishingIds}
-                    regeneratingIds={regeneratingIds}
-                    dryRunMode={settings.dryRunMode}
-                    pageName={pageLabel}
-                    initialFilter={tableInitialFilter}
-                    externalAddTrigger={addPostTrigger}
-                    isRequeuingFailed={isRequeuingFailed}
-                    onRequeueFailed={handleRequeueFailed}
-                    onAddManualPost={handleAddManualPost}
-                    onUpdatePost={handleUpdatePost}
-                    onPublishNow={handlePublishNow}
-                    onRegeneratePart={handleRegeneratePart}
-                    onDeletePost={handleDeletePost}
-                  />
-                </div>
+              {/* Full-Width Schedule Table (Unconstrained Desktop & Mobile Rendering) */}
+              <div className="min-w-0">
+                <MonthlyScheduleTable
+                  apiFetch={apiFetch}
+                  refreshKey={tableRefreshKey}
+                  recurringTimes={settings.recurringTimes}
+                  publishingIds={publishingIds}
+                  regeneratingIds={regeneratingIds}
+                  dryRunMode={settings.dryRunMode}
+                  cloudinaryConfigured={Boolean(settings.mediaConfig?.configured)}
+                  pageName={pageLabel}
+                  initialFilter={tableInitialFilter}
+                  externalAddTrigger={addPostTrigger}
+                  isRequeuingFailed={isRequeuingFailed}
+                  onOpenBulkImport={() => setIsBulkImportOpen(true)}
+                  onRequeueFailed={handleRequeueFailed}
+                  onAddManualPost={handleAddManualPost}
+                  onUpdatePost={handleUpdatePost}
+                  onPublishNow={handlePublishNow}
+                  onRegeneratePart={handleRegeneratePart}
+                  onDeletePost={handleDeletePost}
+                />
               </div>
             </div>
           )}
@@ -1274,10 +1336,12 @@ export default function App() {
               publishingIds={publishingIds}
               regeneratingIds={regeneratingIds}
               dryRunMode={settings.dryRunMode}
+              cloudinaryConfigured={Boolean(settings.mediaConfig?.configured)}
               pageName={pageLabel}
               initialFilter={tableInitialFilter}
               externalAddTrigger={addPostTrigger}
               isRequeuingFailed={isRequeuingFailed}
+              onOpenBulkImport={() => setIsBulkImportOpen(true)}
               onRequeueFailed={handleRequeueFailed}
               onAddManualPost={handleAddManualPost}
               onUpdatePost={handleUpdatePost}
@@ -1416,6 +1480,14 @@ export default function App() {
         onVerifyConnection={handleVerifyFacebookConnection}
         onExchangeToken={handleExchangeFacebookToken}
         onSave={handleSaveSettings}
+      />
+
+      <BulkImportModal
+        isOpen={isBulkImportOpen}
+        defaultSlotTime={settings.recurringTimes[0] || '09:00'}
+        apiFetch={apiFetch}
+        onClose={() => setIsBulkImportOpen(false)}
+        onImportConfirmed={handleBulkImportPosts}
       />
 
       <SecurityModal

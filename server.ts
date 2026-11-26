@@ -61,6 +61,15 @@ import {
   resolveEffectiveEnvFacebookCredentials,
   setFacebookTokenErrorNotice,
 } from './server/fbToken.ts';
+import {
+  createCloudinaryUploadSignature,
+  getCloudinaryPublicStatus,
+  validateSafeMediaUrl,
+} from './server/cloudinary.ts';
+import {
+  extractGoogleSheetExportUrl,
+  parseWorkbookBufferToRows,
+} from './server/sheetImport.ts';
 import { buildMl30DayCurriculumPosts } from './server/mlCurriculum.ts';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -587,6 +596,7 @@ export async function createServerApp(options: { standalone?: boolean } = {}) {
     return {
       ...base,
       tokenStatus,
+      mediaConfig: getCloudinaryPublicStatus(),
     };
   }
 
@@ -793,13 +803,32 @@ export async function createServerApp(options: { standalone?: boolean } = {}) {
       }
 
       const message = formatFbMessage(post);
-      const graphUrl = `https://graph.facebook.com/v27.0/${encodeURIComponent(
+      const safeMediaUrl =
+        post.mediaType !== 'none' ? validateSafeMediaUrl(post.mediaUrl) : null;
+
+      let graphUrl = `https://graph.facebook.com/v27.0/${encodeURIComponent(
         resolved.effectivePageId
       )}/feed`;
       const params = new URLSearchParams();
-      params.append('message', message);
       params.append('published', 'true');
       params.append('access_token', resolved.effectiveToken);
+
+      if (post.mediaType === 'image' && safeMediaUrl) {
+        graphUrl = `https://graph.facebook.com/v27.0/${encodeURIComponent(
+          resolved.effectivePageId
+        )}/photos`;
+        params.append('url', safeMediaUrl);
+        params.append('caption', message);
+      } else if (post.mediaType === 'video' && safeMediaUrl) {
+        graphUrl = `https://graph-video.facebook.com/v27.0/${encodeURIComponent(
+          resolved.effectivePageId
+        )}/videos`;
+        params.append('file_url', safeMediaUrl);
+        params.append('title', post.seoTitle.slice(0, 120));
+        params.append('description', message);
+      } else {
+        params.append('message', message);
+      }
 
       const fbRes = await fetch(graphUrl, {
         method: 'POST',
@@ -809,10 +838,13 @@ export async function createServerApp(options: { standalone?: boolean } = {}) {
 
       const fbJson = (await fbRes.json().catch(() => ({}))) as {
         id?: string;
+        post_id?: string;
         error?: { code?: number; error_subcode?: number; message?: string };
       };
 
-      if (!fbRes.ok || fbJson.error || !fbJson.id) {
+      const publishedFbId = fbJson.post_id || fbJson.id;
+
+      if (!fbRes.ok || fbJson.error || !publishedFbId) {
         let errMsg =
           fbJson.error?.message ||
           `Facebook Graph API returned HTTP ${fbRes.status}`;
@@ -855,15 +887,21 @@ export async function createServerApp(options: { standalone?: boolean } = {}) {
              updated_at = NOW()
          WHERE id = $1
          RETURNING *`,
-        [postId, fbJson.id]
+        [postId, publishedFbId]
       );
       const updated = serializePost(okRes.rows[0]);
       broadcast({ type: 'post:updated', data: updated });
       await recordLog(
         'success',
         'facebook',
-        `${source === 'scheduler' ? 'Auto-published' : 'Published'} "${updated.topicName}" (${updated.slotTime}) to Facebook Page.`,
-        `FB Post ID: ${fbJson.id}`
+        `${source === 'scheduler' ? 'Auto-published' : 'Published'} ${
+          post.mediaType === 'image'
+            ? 'photo post'
+            : post.mediaType === 'video'
+              ? 'video post'
+              : 'post'
+        } "${updated.topicName}" (${updated.slotTime}) to Facebook Page.`,
+        `FB Post ID: ${publishedFbId}`
       );
       return updated;
     } finally {
@@ -1702,6 +1740,16 @@ export async function createServerApp(options: { standalone?: boolean } = {}) {
       const scheduledAt = String(req.body?.scheduledAt ?? '').trim();
       const monthKey = String(req.body?.monthKey ?? '').trim();
       const stageLabel = String(req.body?.stageLabel ?? 'Custom Scheduled Post').trim();
+      const rawMediaType = String(req.body?.mediaType ?? 'none').trim();
+      const mediaUrl = validateSafeMediaUrl(req.body?.mediaUrl);
+      const mediaType: 'none' | 'image' | 'video' =
+        mediaUrl && (rawMediaType === 'image' || rawMediaType === 'video')
+          ? rawMediaType
+          : 'none';
+      const mediaPublicId =
+        mediaType !== 'none' && typeof req.body?.mediaPublicId === 'string'
+          ? req.body.mediaPublicId.trim() || null
+          : null;
 
       if (!topicName || !seoTitle || !seoDescription || !scheduledAt || !monthKey) {
         return res.status(400).json({
@@ -1715,9 +1763,10 @@ export async function createServerApp(options: { standalone?: boolean } = {}) {
       const result = await pool.query<DbPostRow>(
         `INSERT INTO scheduled_posts (
            id, month_key, topic_name, part_number, total_parts, stage_label,
-           seo_title, seo_description, seo_tags, slot_time, scheduled_at, status
+           seo_title, seo_description, seo_tags, media_type, media_url, media_public_id,
+           slot_time, scheduled_at, status
          )
-         VALUES ($1, $2, $3, 1, 1, $4, $5, $6, $7::jsonb, $8, $9::timestamptz, 'PENDING')
+         VALUES ($1, $2, $3, 1, 1, $4, $5, $6, $7::jsonb, $8, $9, $10, $11, $12::timestamptz, 'PENDING')
          RETURNING *`,
         [
           id,
@@ -1727,6 +1776,9 @@ export async function createServerApp(options: { standalone?: boolean } = {}) {
           seoTitle,
           seoDescription,
           JSON.stringify(seoTags),
+          mediaType,
+          mediaType === 'none' ? null : mediaUrl,
+          mediaPublicId,
           slotTime,
           scheduledAt,
         ]
@@ -1743,6 +1795,87 @@ export async function createServerApp(options: { standalone?: boolean } = {}) {
     } catch (err: unknown) {
       return res.status(500).json({
         error: err instanceof Error ? err.message : 'Failed to create post.',
+      });
+    }
+  });
+
+  app.post('/api/posts/bulk-import', requireAuth, async (req: AuthenticatedRequest, res: Response) => {
+    try {
+      const dbCheck = await initDatabase();
+      if (!dbCheck.ok) {
+        return res.status(503).json({ error: dbCheck.error });
+      }
+      const rawRows = Array.isArray(req.body?.rows) ? req.body.rows : [];
+      if (rawRows.length === 0 || rawRows.length > 300) {
+        return res.status(400).json({
+          error: 'Bulk import requires between 1 and 300 rows.',
+        });
+      }
+
+      const pool = getPool();
+      const inserted: ReturnType<typeof serializePost>[] = [];
+
+      for (let i = 0; i < rawRows.length; i += 1) {
+        const item = rawRows[i] || {};
+        const seoTitle = clampTitle(item.seoTitle || item.topicName || `Imported Post #${i + 1}`);
+        const seoDescription = String(item.seoDescription ?? seoTitle).trim();
+        const topicName = String(item.topicName || seoTitle).trim().slice(0, 80) || 'Imported Series';
+        const stageLabel = String(item.stageLabel || `Imported Row #${i + 1}`).trim();
+        const seoTags = sanitizeTags(item.seoTags);
+        const slotTime = String(item.slotTime ?? '09:00').trim() || '09:00';
+        const scheduledAt = String(item.scheduledAt ?? new Date().toISOString()).trim();
+        const monthKey = String(item.monthKey ?? scheduledAt.slice(0, 7)).trim();
+        const mediaUrl = validateSafeMediaUrl(item.mediaUrl);
+        const mediaType: 'none' | 'image' | 'video' =
+          mediaUrl && (item.mediaType === 'image' || item.mediaType === 'video')
+            ? item.mediaType
+            : 'none';
+
+        if (!seoTitle || !scheduledAt || !monthKey) continue;
+
+        const id = makeId('post');
+        const rowRes = await pool.query<DbPostRow>(
+          `INSERT INTO scheduled_posts (
+             id, month_key, topic_name, part_number, total_parts, stage_label,
+             seo_title, seo_description, seo_tags, media_type, media_url,
+             slot_time, scheduled_at, status
+           )
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10, $11, $12, $13::timestamptz, 'PENDING')
+           RETURNING *`,
+          [
+            id,
+            monthKey,
+            topicName,
+            i + 1,
+            rawRows.length,
+            stageLabel,
+            seoTitle,
+            seoDescription,
+            JSON.stringify(seoTags),
+            mediaType,
+            mediaType === 'none' ? null : mediaUrl,
+            slotTime,
+            scheduledAt,
+          ]
+        );
+        if (rowRes.rows[0]) {
+          inserted.push(serializePost(rowRes.rows[0]));
+        }
+      }
+
+      if (inserted.length > 0) {
+        broadcast({ type: 'posts:bulk_created', data: inserted });
+        await recordLog(
+          'success',
+          'storage',
+          `Bulk imported ${inserted.length} scheduled posts from Excel / Google Sheet into PostgreSQL.`
+        );
+      }
+
+      return res.status(201).json({ count: inserted.length, posts: inserted });
+    } catch (err: unknown) {
+      return res.status(500).json({
+        error: err instanceof Error ? err.message : 'Bulk import failed.',
       });
     }
   });
@@ -1792,6 +1925,31 @@ export async function createServerApp(options: { standalone?: boolean } = {}) {
         req.body?.monthKey !== undefined
           ? String(req.body.monthKey).trim() || existing.monthKey
           : existing.monthKey;
+
+      let mediaType: 'none' | 'image' | 'video' = existing.mediaType;
+      let mediaUrl: string | null = existing.mediaUrl ?? null;
+      let mediaPublicId: string | null = existing.mediaPublicId ?? null;
+
+      if (req.body?.mediaType !== undefined || req.body?.mediaUrl !== undefined) {
+        const nextType = String(req.body?.mediaType ?? existing.mediaType).trim();
+        const nextUrl =
+          req.body?.mediaUrl !== undefined
+            ? validateSafeMediaUrl(req.body.mediaUrl)
+            : existing.mediaUrl ?? null;
+        if (nextType === 'none' || !nextUrl) {
+          mediaType = 'none';
+          mediaUrl = null;
+          mediaPublicId = null;
+        } else if (nextType === 'image' || nextType === 'video') {
+          mediaType = nextType;
+          mediaUrl = nextUrl;
+          mediaPublicId =
+            typeof req.body?.mediaPublicId === 'string'
+              ? req.body.mediaPublicId.trim() || null
+              : existing.mediaPublicId ?? null;
+        }
+      }
+
       const scheduleEdited =
         scheduledAt !== existing.scheduledAt || slotTime !== existing.slotTime;
       const status =
@@ -1807,11 +1965,14 @@ export async function createServerApp(options: { standalone?: boolean } = {}) {
              seo_title = $4,
              seo_description = $5,
              seo_tags = $6::jsonb,
-             slot_time = $7,
-             scheduled_at = $8::timestamptz,
-             month_key = $9,
-             status = $10,
-             error_message = CASE WHEN $10 = 'PENDING' THEN NULL ELSE error_message END,
+             media_type = $7,
+             media_url = $8,
+             media_public_id = $9,
+             slot_time = $10,
+             scheduled_at = $11::timestamptz,
+             month_key = $12,
+             status = $13,
+             error_message = CASE WHEN $13 = 'PENDING' THEN NULL ELSE error_message END,
              updated_at = NOW()
          WHERE id = $1
          RETURNING *`,
@@ -1822,6 +1983,9 @@ export async function createServerApp(options: { standalone?: boolean } = {}) {
           seoTitle,
           seoDescription,
           JSON.stringify(seoTags),
+          mediaType,
+          mediaUrl,
+          mediaPublicId,
           slotTime,
           scheduledAt,
           monthKey,
@@ -2466,6 +2630,75 @@ Create a fresh angle and stronger hook distinct from: "${post.seoTitle}".`,
       nextRunAt: nextSchedulerRunAt,
     });
   };
+
+  app.post('/api/media/signature', requireAuth, async (req: AuthenticatedRequest, res: Response) => {
+    try {
+      const resourceType =
+        req.body?.resourceType === 'video' ? 'video' : 'image';
+      const signed = createCloudinaryUploadSignature(resourceType);
+      return res.json(signed);
+    } catch (err: unknown) {
+      return res.status(400).json({
+        error:
+          err instanceof Error
+            ? err.message
+            : 'Failed to generate Cloudinary upload signature.',
+      });
+    }
+  });
+
+  app.post('/api/import/google-sheet', requireAuth, async (req: AuthenticatedRequest, res: Response) => {
+    try {
+      const sheetUrl = String(req.body?.sheetUrl ?? '').trim();
+      const defaultSlotTime = String(req.body?.defaultSlotTime ?? '09:00').trim();
+      const extracted = extractGoogleSheetExportUrl(sheetUrl);
+      if (!extracted.ok) {
+        return res.status(400).json({ error: extracted.error });
+      }
+
+      const fetchRes = await fetch(extracted.exportUrl, {
+        headers: {
+          Accept:
+            'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet, application/octet-stream',
+        },
+        redirect: 'follow',
+      });
+
+      if (!fetchRes.ok) {
+        return res.status(400).json({
+          error: `Could not download Google Sheet (HTTP ${fetchRes.status}). Make sure sharing is set to "Anyone with the link can view", or export as .xlsx and upload the file directly.`,
+        });
+      }
+
+      const contentType = fetchRes.headers.get('content-type') || '';
+      if (contentType.includes('text/html')) {
+        return res.status(400).json({
+          error:
+            'Google Sheet returned a sign-in HTML page. Set Google Sheet sharing to "Anyone with the link (Viewer)" or download it as .xlsx and upload it.',
+        });
+      }
+
+      const arrayBuf = await fetchRes.arrayBuffer();
+      const parsed = parseWorkbookBufferToRows(
+        Buffer.from(arrayBuf),
+        defaultSlotTime
+      );
+      return res.json({
+        ok: true,
+        sheetId: extracted.sheetId,
+        sheetName: parsed.sheetName,
+        rows: parsed.rows,
+        skippedCount: parsed.skippedCount,
+      });
+    } catch (err: unknown) {
+      return res.status(500).json({
+        error:
+          err instanceof Error
+            ? err.message
+            : 'Failed to fetch Google Sheet.',
+      });
+    }
+  });
 
   app.get('/api/cron/scheduler', handleCronScheduler);
   app.post('/api/cron/scheduler', handleCronScheduler);

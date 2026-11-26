@@ -261,7 +261,7 @@ export const MonthlyPlannerPanel: React.FC<MonthlyPlannerPanelProps> = ({
       <form onSubmit={handleSubmit} className="space-y-4">
         {/* Month & Range Controls */}
         <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-          <div>
+          <div className="min-w-0">
             <label
               htmlFor="target-month"
               className="block text-xs font-medium text-[#1C1E21] mb-1"
@@ -281,7 +281,7 @@ export const MonthlyPlannerPanel: React.FC<MonthlyPlannerPanelProps> = ({
             </div>
           </div>
 
-          <div>
+          <div className="min-w-0">
             <label
               htmlFor="start-day"
               className="block text-xs font-medium text-[#1C1E21] mb-1"

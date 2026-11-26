@@ -36,6 +36,9 @@ export interface DbPostRow {
   seo_title: string;
   seo_description: string;
   seo_tags: string[];
+  media_type: 'none' | 'image' | 'video';
+  media_url: string | null;
+  media_public_id: string | null;
   slot_time: string;
   scheduled_at: Date | string;
   status: 'PENDING' | 'POSTED' | 'FAILED';
@@ -191,6 +194,9 @@ export async function initDatabase(): Promise<{ ok: boolean; error?: string }> {
         seo_title TEXT NOT NULL,
         seo_description TEXT NOT NULL,
         seo_tags JSONB NOT NULL DEFAULT '[]'::jsonb,
+        media_type TEXT NOT NULL DEFAULT 'none' CHECK (media_type IN ('none', 'image', 'video')),
+        media_url TEXT,
+        media_public_id TEXT,
         slot_time TEXT NOT NULL,
         scheduled_at TIMESTAMPTZ NOT NULL,
         status TEXT NOT NULL DEFAULT 'PENDING' CHECK (status IN ('PENDING', 'POSTED', 'FAILED')),
@@ -201,6 +207,12 @@ export async function initDatabase(): Promise<{ ok: boolean; error?: string }> {
         created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
         updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
       );
+    `);
+
+    await db.query(`
+      ALTER TABLE scheduled_posts ADD COLUMN IF NOT EXISTS media_type TEXT NOT NULL DEFAULT 'none';
+      ALTER TABLE scheduled_posts ADD COLUMN IF NOT EXISTS media_url TEXT;
+      ALTER TABLE scheduled_posts ADD COLUMN IF NOT EXISTS media_public_id TEXT;
     `);
 
     await db.query(`
@@ -250,6 +262,12 @@ export function serializePost(row: DbPostRow) {
     seoTitle: row.seo_title,
     seoDescription: row.seo_description,
     seoTags: Array.isArray(row.seo_tags) ? row.seo_tags : [],
+    mediaType: (row.media_type === 'image' || row.media_type === 'video' ? row.media_type : 'none') as
+      | 'none'
+      | 'image'
+      | 'video',
+    mediaUrl: row.media_url ?? undefined,
+    mediaPublicId: row.media_public_id ?? undefined,
     slotTime: row.slot_time,
     scheduledAt:
       row.scheduled_at instanceof Date

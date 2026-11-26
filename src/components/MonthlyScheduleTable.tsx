@@ -9,7 +9,10 @@ import {
   Clock,
   Edit3,
   ExternalLink,
+  FileSpreadsheet,
+  Film,
   FlaskConical,
+  Image as ImageIcon,
   Loader2,
   Plus,
   RefreshCw,
@@ -22,6 +25,7 @@ import {
   XCircle,
 } from 'lucide-react';
 import type {
+  MediaType,
   PaginatedPostsResponse,
   PaginationMeta,
   PostSortOrder,
@@ -38,6 +42,7 @@ import {
   localDateTimeInputToIso,
 } from '../utils/schedule';
 import { FacebookFeedPreview } from './FacebookFeedPreview';
+import { MediaUploadField } from './MediaUploadField';
 
 interface MonthlyScheduleTableProps {
   apiFetch: <T>(url: string, options?: RequestInit) => Promise<T>;
@@ -46,10 +51,12 @@ interface MonthlyScheduleTableProps {
   publishingIds: Set<string>;
   regeneratingIds: Set<string>;
   dryRunMode: boolean;
+  cloudinaryConfigured: boolean;
   pageName?: string;
   initialFilter?: QueueFilter;
   externalAddTrigger?: number;
   isRequeuingFailed?: boolean;
+  onOpenBulkImport: () => void;
   onRequeueFailed: () => Promise<void>;
   onAddManualPost: (payload: {
     topicName: string;
@@ -57,6 +64,9 @@ interface MonthlyScheduleTableProps {
     seoTitle: string;
     seoDescription: string;
     seoTags: string[];
+    mediaType: MediaType;
+    mediaUrl?: string;
+    mediaPublicId?: string;
     slotTime: string;
     scheduledAt: string;
     monthKey: string;
@@ -69,6 +79,9 @@ interface MonthlyScheduleTableProps {
       seoTitle?: string;
       seoDescription?: string;
       seoTags?: string[];
+      mediaType?: MediaType;
+      mediaUrl?: string;
+      mediaPublicId?: string;
       slotTime?: string;
       scheduledAt?: string;
       monthKey?: string;
@@ -123,10 +136,12 @@ export const MonthlyScheduleTable: React.FC<MonthlyScheduleTableProps> = ({
   publishingIds,
   regeneratingIds,
   dryRunMode,
+  cloudinaryConfigured,
   pageName = 'Parvez Dev',
   initialFilter = 'ALL',
   externalAddTrigger = 0,
   isRequeuingFailed = false,
+  onOpenBulkImport,
   onRequeueFailed,
   onAddManualPost,
   onUpdatePost,
@@ -143,7 +158,6 @@ export const MonthlyScheduleTable: React.FC<MonthlyScheduleTableProps> = ({
   const [limit, setLimit] = useState<number>(15);
   const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null);
 
-  // Server-side paginated response state
   const [rows, setRows] = useState<ScheduledPost[]>([]);
   const [pagination, setPagination] = useState<PaginationMeta>({
     page: 1,
@@ -177,7 +191,6 @@ export const MonthlyScheduleTable: React.FC<MonthlyScheduleTableProps> = ({
     }
   }, [externalAddTrigger]);
 
-  // Debounce search input before hitting server
   useEffect(() => {
     const timer = window.setTimeout(() => {
       setDebouncedSearch(searchInput.trim());
@@ -236,6 +249,9 @@ export const MonthlyScheduleTable: React.FC<MonthlyScheduleTableProps> = ({
   const [editTitle, setEditTitle] = useState('');
   const [editBody, setEditBody] = useState('');
   const [editTags, setEditTags] = useState('');
+  const [editMediaType, setEditMediaType] = useState<MediaType>('none');
+  const [editMediaUrl, setEditMediaUrl] = useState('');
+  const [editMediaPublicId, setEditMediaPublicId] = useState<string | undefined>(undefined);
   const [editDateTimeLocal, setEditDateTimeLocal] = useState('');
   const [isSavingEdit, setIsSavingEdit] = useState(false);
 
@@ -245,6 +261,9 @@ export const MonthlyScheduleTable: React.FC<MonthlyScheduleTableProps> = ({
   const [newTitle, setNewTitle] = useState('');
   const [newBody, setNewBody] = useState('');
   const [newTags, setNewTags] = useState('#MachineLearning #AI #Tech');
+  const [newMediaType, setNewMediaType] = useState<MediaType>('none');
+  const [newMediaUrl, setNewMediaUrl] = useState('');
+  const [newMediaPublicId, setNewMediaPublicId] = useState<string | undefined>(undefined);
   const [newDateTimeLocal, setNewDateTimeLocal] = useState(() => {
     const now = new Date();
     const pad = (n: number) => String(n).padStart(2, '0');
@@ -260,6 +279,9 @@ export const MonthlyScheduleTable: React.FC<MonthlyScheduleTableProps> = ({
     setEditTitle(post.seoTitle);
     setEditBody(post.seoDescription);
     setEditTags(post.seoTags.join(' '));
+    setEditMediaType(post.mediaType || 'none');
+    setEditMediaUrl(post.mediaUrl || '');
+    setEditMediaPublicId(post.mediaPublicId);
     setEditDateTimeLocal(isoToLocalDateTimeInput(post.scheduledAt));
   };
 
@@ -285,6 +307,9 @@ export const MonthlyScheduleTable: React.FC<MonthlyScheduleTableProps> = ({
         seoTitle: editTitle.trim(),
         seoDescription: editBody.trim(),
         seoTags: tags,
+        mediaType: editMediaUrl.trim() ? editMediaType : 'none',
+        mediaUrl: editMediaUrl.trim(),
+        mediaPublicId: editMediaPublicId,
         scheduledAt: iso,
         slotTime,
         monthKey,
@@ -317,6 +342,9 @@ export const MonthlyScheduleTable: React.FC<MonthlyScheduleTableProps> = ({
         seoTitle: newTitle.trim(),
         seoDescription: newBody.trim(),
         seoTags: tags,
+        mediaType: newMediaUrl.trim() ? newMediaType : 'none',
+        mediaUrl: newMediaUrl.trim() || undefined,
+        mediaPublicId: newMediaPublicId,
         slotTime,
         scheduledAt: iso,
         monthKey: monthKey || getCurrentMonthKey(),
@@ -325,6 +353,9 @@ export const MonthlyScheduleTable: React.FC<MonthlyScheduleTableProps> = ({
       setNewTopic('');
       setNewTitle('');
       setNewBody('');
+      setNewMediaType('none');
+      setNewMediaUrl('');
+      setNewMediaPublicId(undefined);
     } finally {
       setIsAdding(false);
     }
@@ -349,6 +380,28 @@ export const MonthlyScheduleTable: React.FC<MonthlyScheduleTableProps> = ({
     );
   };
 
+  const renderMediaThumb = (post: ScheduledPost) => {
+    if (!post.mediaUrl || post.mediaType === 'none') return null;
+    if (post.mediaType === 'video') {
+      return (
+        <div
+          title="Video attachment"
+          className="w-11 h-11 rounded-lg bg-[#1C1E21] text-white flex items-center justify-center shrink-0"
+        >
+          <Film className="w-4 h-4" />
+        </div>
+      );
+    }
+    return (
+      <img
+        src={post.mediaUrl}
+        alt=""
+        referrerPolicy="no-referrer"
+        className="w-11 h-11 rounded-lg object-cover border border-[#E4E6EB] bg-[#F0F2F5] shrink-0"
+      />
+    );
+  };
+
   const pageNumbers = useMemo(
     () => buildPageNumbers(pagination.page, pagination.totalPages),
     [pagination.page, pagination.totalPages]
@@ -369,7 +422,7 @@ export const MonthlyScheduleTable: React.FC<MonthlyScheduleTableProps> = ({
     >
       {/* Header & Controls */}
       <div className="p-4 sm:p-5 border-b border-[#E4E6EB] space-y-4">
-        <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
+        <div className="flex flex-col md:flex-row md:items-center md:justify-between gap-3">
           <div>
             <div className="flex items-center gap-2">
               <h2
@@ -386,7 +439,7 @@ export const MonthlyScheduleTable: React.FC<MonthlyScheduleTableProps> = ({
               )}
             </div>
             <p className="text-xs text-[#65676B] mt-0.5">
-              Server-side PostgreSQL pagination across recurring daily publishing slots.
+              Supports text, Cloudinary image &amp; video attachments, and Excel / Google Sheets bulk import.
             </p>
           </div>
 
@@ -406,6 +459,15 @@ export const MonthlyScheduleTable: React.FC<MonthlyScheduleTableProps> = ({
                 <span>Re-queue Failed ({counts.failed})</span>
               </button>
             )}
+
+            <button
+              type="button"
+              onClick={onOpenBulkImport}
+              className="inline-flex items-center justify-center gap-1.5 px-3.5 py-2 text-xs font-semibold text-[#1C1E21] bg-[#E4E6EB] hover:bg-[#D8DADF] rounded-lg whitespace-nowrap shrink-0 cursor-pointer min-h-[38px]"
+            >
+              <FileSpreadsheet className="w-3.5 h-3.5 text-[#1877F2]" />
+              <span>Import Excel / Sheet</span>
+            </button>
 
             <button
               type="button"
@@ -533,13 +595,13 @@ export const MonthlyScheduleTable: React.FC<MonthlyScheduleTableProps> = ({
           </h3>
           <p className="mt-1 text-xs text-[#65676B] max-w-md mx-auto">
             {counts.all === 0 && !debouncedSearch && selectedMonth === 'ALL'
-              ? 'Use the Monthly Topic & Time-Slot Planner to generate a schedule, load the 30-Day ML Curriculum, or add a custom post.'
+              ? 'Use the Monthly Planner, import an Excel / Google Sheet, or create a custom image/video post.'
               : 'Reset status tabs, month filter, or search text to view other scheduled posts.'}
           </p>
         </div>
       ) : (
         <>
-          {/* Mobile & Tablet Responsive Card Feed (< lg) */}
+          {/* Mobile & Compact Card View (< lg) */}
           <div className="lg:hidden divide-y divide-[#E4E6EB]">
             {rows.map((post) => {
               const isPublishing = publishingIds.has(post.id);
@@ -560,27 +622,39 @@ export const MonthlyScheduleTable: React.FC<MonthlyScheduleTableProps> = ({
                     {renderStatusIndicator(post)}
                   </div>
 
-                  <div>
-                    <div className="text-xs text-[#65676B] truncate">
-                      {post.topicName} <span aria-hidden="true">·</span> {post.stageLabel}
-                    </div>
-                    <button
-                      type="button"
-                      onClick={() => openEditor(post)}
-                      className="mt-0.5 text-left font-display text-sm font-bold text-[#1C1E21] hover:text-[#1877F2] cursor-pointer"
-                    >
-                      {post.seoTitle}
-                    </button>
-                    <p className="mt-1 text-xs text-[#65676B] line-clamp-2 leading-relaxed">
-                      {post.seoDescription}
-                    </p>
-                    {post.seoTags.length > 0 && (
-                      <div className="mt-1.5 flex flex-wrap gap-x-2 gap-y-0.5 font-mono text-[11px] text-[#1877F2]">
-                        {post.seoTags.map((t) => (
-                          <span key={t}>{t}</span>
-                        ))}
+                  <div className="flex items-start gap-3">
+                    {renderMediaThumb(post)}
+                    <div className="min-w-0 flex-1">
+                      <div className="text-xs text-[#65676B] truncate">
+                        {post.topicName} <span aria-hidden="true">·</span> {post.stageLabel}
+                        {post.mediaType !== 'none' && (
+                          <>
+                            {' '}
+                            <span aria-hidden="true">·</span>{' '}
+                            <span className="text-[#1877F2] font-medium">
+                              {post.mediaType === 'video' ? 'Video' : 'Image'}
+                            </span>
+                          </>
+                        )}
                       </div>
-                    )}
+                      <button
+                        type="button"
+                        onClick={() => openEditor(post)}
+                        className="mt-0.5 text-left font-display text-sm font-bold text-[#1C1E21] hover:text-[#1877F2] cursor-pointer"
+                      >
+                        {post.seoTitle}
+                      </button>
+                      <p className="mt-1 text-xs text-[#65676B] line-clamp-2 leading-relaxed">
+                        {post.seoDescription}
+                      </p>
+                      {post.seoTags.length > 0 && (
+                        <div className="mt-1.5 flex flex-wrap gap-x-2 gap-y-0.5 font-mono text-[11px] text-[#1877F2]">
+                          {post.seoTags.map((t) => (
+                            <span key={t}>{t}</span>
+                          ))}
+                        </div>
+                      )}
+                    </div>
                   </div>
 
                   {post.status === 'FAILED' && post.errorMessage && (
@@ -695,16 +769,16 @@ export const MonthlyScheduleTable: React.FC<MonthlyScheduleTableProps> = ({
             })}
           </div>
 
-          {/* Desktop 5-Column Zero-Overflow Table (lg+) */}
+          {/* Desktop 5-Column Fluid Responsive Table (lg+) */}
           <div className="hidden lg:block overflow-x-auto">
-            <table className="w-full text-left border-collapse table-fixed">
+            <table className="w-full text-left border-collapse">
               <thead>
                 <tr className="bg-[#F7F8FA] border-b border-[#E4E6EB] text-[11px] font-semibold text-[#65676B] tracking-wide">
-                  <th className="py-3 px-4 w-[132px] whitespace-nowrap">Schedule &amp; Slot</th>
-                  <th className="py-3 px-4">Topic &amp; Post Copy</th>
-                  <th className="py-3 px-3 w-[108px] whitespace-nowrap">Status</th>
-                  <th className="py-3 px-3 w-[160px] whitespace-nowrap">Published / FB</th>
-                  <th className="py-3 px-4 w-[178px] text-right whitespace-nowrap">Actions</th>
+                  <th className="py-3 px-4 w-32 whitespace-nowrap">Schedule &amp; Slot</th>
+                  <th className="py-3 px-4 min-w-[260px]">Topic, Media &amp; Copy</th>
+                  <th className="py-3 px-3 w-28 whitespace-nowrap">Status</th>
+                  <th className="py-3 px-3 w-40 whitespace-nowrap">Published / FB</th>
+                  <th className="py-3 px-4 w-44 text-right whitespace-nowrap">Actions</th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-[#E4E6EB] text-xs">
@@ -726,48 +800,66 @@ export const MonthlyScheduleTable: React.FC<MonthlyScheduleTableProps> = ({
                         </div>
                       </td>
 
-                      <td className="py-3.5 px-4 min-w-0">
-                        <div className="flex items-center gap-1.5 text-[11px] text-[#65676B] truncate">
-                          <span className="font-semibold text-[#1C1E21] truncate">
-                            {post.topicName}
-                          </span>
-                          <span aria-hidden="true">·</span>
-                          <span className="truncate">{post.stageLabel}</span>
-                        </div>
+                      <td className="py-3.5 px-4">
+                        <div className="flex items-start gap-3">
+                          {renderMediaThumb(post)}
+                          <div className="min-w-0 flex-1">
+                            <div className="flex flex-wrap items-center gap-1.5 text-[11px] text-[#65676B]">
+                              <span className="font-semibold text-[#1C1E21] truncate max-w-[220px]">
+                                {post.topicName}
+                              </span>
+                              <span aria-hidden="true">·</span>
+                              <span className="truncate max-w-[180px]">{post.stageLabel}</span>
+                              {post.mediaType !== 'none' && (
+                                <>
+                                  <span aria-hidden="true">·</span>
+                                  <span className="inline-flex items-center gap-1 font-medium text-[#1877F2]">
+                                    {post.mediaType === 'video' ? (
+                                      <Film className="w-3 h-3" />
+                                    ) : (
+                                      <ImageIcon className="w-3 h-3" />
+                                    )}
+                                    <span>{post.mediaType === 'video' ? 'Video' : 'Image'}</span>
+                                  </span>
+                                </>
+                              )}
+                            </div>
 
-                        <button
-                          type="button"
-                          onClick={() => openEditor(post)}
-                          className="mt-0.5 text-left group cursor-pointer block w-full"
-                        >
-                          <div className="font-semibold text-[#1C1E21] group-hover:text-[#1877F2] transition-colors truncate">
-                            {post.seoTitle}
-                          </div>
-                          <p className="mt-0.5 text-[#65676B] line-clamp-2 leading-relaxed">
-                            {post.seoDescription}
-                          </p>
-                        </button>
-
-                        {post.seoTags.length > 0 && (
-                          <div className="mt-1.5 flex flex-wrap gap-x-2 gap-y-0.5 font-mono text-[11px] text-[#1877F2]">
-                            {post.seoTags.slice(0, 4).map((t) => (
-                              <span key={t}>{t}</span>
-                            ))}
-                          </div>
-                        )}
-
-                        {post.status === 'FAILED' && post.errorMessage && (
-                          <div className="mt-1.5 text-[11px] text-red-700 bg-red-50 border border-red-200 rounded-md px-2.5 py-1 flex items-start justify-between gap-2">
-                            <span className="line-clamp-2">{post.errorMessage}</span>
                             <button
                               type="button"
-                              onClick={() => void onUpdatePost(post.id, { status: 'PENDING' })}
-                              className="font-semibold text-[#1877F2] hover:underline shrink-0 cursor-pointer"
+                              onClick={() => openEditor(post)}
+                              className="mt-0.5 text-left group cursor-pointer block w-full"
                             >
-                              Re-queue
+                              <div className="font-semibold text-[#1C1E21] group-hover:text-[#1877F2] transition-colors line-clamp-1">
+                                {post.seoTitle}
+                              </div>
+                              <p className="mt-0.5 text-[#65676B] line-clamp-2 leading-relaxed">
+                                {post.seoDescription}
+                              </p>
                             </button>
+
+                            {post.seoTags.length > 0 && (
+                              <div className="mt-1.5 flex flex-wrap gap-x-2 gap-y-0.5 font-mono text-[11px] text-[#1877F2]">
+                                {post.seoTags.slice(0, 4).map((t) => (
+                                  <span key={t}>{t}</span>
+                                ))}
+                              </div>
+                            )}
+
+                            {post.status === 'FAILED' && post.errorMessage && (
+                              <div className="mt-1.5 text-[11px] text-red-700 bg-red-50 border border-red-200 rounded-md px-2.5 py-1 flex items-start justify-between gap-2">
+                                <span className="line-clamp-2">{post.errorMessage}</span>
+                                <button
+                                  type="button"
+                                  onClick={() => void onUpdatePost(post.id, { status: 'PENDING' })}
+                                  className="font-semibold text-[#1877F2] hover:underline shrink-0 cursor-pointer"
+                                >
+                                  Re-queue
+                                </button>
+                              </div>
+                            )}
                           </div>
-                        )}
+                        </div>
                       </td>
 
                       <td className="py-3.5 px-3 whitespace-nowrap">
@@ -1010,14 +1102,14 @@ export const MonthlyScheduleTable: React.FC<MonthlyScheduleTableProps> = ({
           role="dialog"
           aria-modal="true"
         >
-          <div className="w-full max-w-4xl bg-white border border-[#E4E6EB] rounded-2xl shadow-xl overflow-hidden max-h-[92vh] flex flex-col">
+          <div className="w-full max-w-5xl bg-white border border-[#E4E6EB] rounded-2xl shadow-xl overflow-hidden max-h-[92vh] flex flex-col">
             <div className="flex items-center justify-between px-5 sm:px-6 py-4 border-b border-[#E4E6EB]">
               <div>
                 <h3 className="font-display text-base font-bold text-[#1C1E21]">
                   Edit Scheduled Post &amp; Live FB Preview
                 </h3>
                 <p className="text-xs text-[#65676B]">
-                  Updates save to PostgreSQL and sync across active sessions.
+                  Attach an image or video via Cloudinary, edit copy, and save to PostgreSQL.
                 </p>
               </div>
               <button
@@ -1113,13 +1205,26 @@ export const MonthlyScheduleTable: React.FC<MonthlyScheduleTableProps> = ({
                     Post Body
                   </label>
                   <textarea
-                    rows={7}
+                    rows={5}
                     required
                     value={editBody}
                     onChange={(e) => setEditBody(e.target.value)}
                     className="w-full px-3 py-2 text-sm border border-[#CCD0D5] rounded-lg leading-relaxed focus:outline-none focus:border-[#1877F2]"
                   />
                 </div>
+
+                <MediaUploadField
+                  mediaType={editMediaType}
+                  mediaUrl={editMediaUrl}
+                  mediaPublicId={editMediaPublicId}
+                  cloudinaryConfigured={cloudinaryConfigured}
+                  apiFetch={apiFetch}
+                  onChange={(next) => {
+                    setEditMediaType(next.mediaType);
+                    setEditMediaUrl(next.mediaUrl);
+                    setEditMediaPublicId(next.mediaPublicId);
+                  }}
+                />
               </div>
 
               <div className="lg:col-span-5 space-y-3">
@@ -1136,6 +1241,8 @@ export const MonthlyScheduleTable: React.FC<MonthlyScheduleTableProps> = ({
                       seoTitle: editTitle,
                       seoDescription: editBody,
                       seoTags: editTags.split(/[\s,]+/).filter(Boolean),
+                      mediaType: editMediaUrl.trim() ? editMediaType : 'none',
+                      mediaUrl: editMediaUrl.trim() || undefined,
                       slotTime: editDateTimeLocal.split('T')[1] || editingPost.slotTime,
                       scheduledAt: localDateTimeInputToIso(editDateTimeLocal),
                       status: editingPost.status,
@@ -1196,7 +1303,7 @@ export const MonthlyScheduleTable: React.FC<MonthlyScheduleTableProps> = ({
           role="dialog"
           aria-modal="true"
         >
-          <div className="w-full max-w-lg bg-white border border-[#E4E6EB] rounded-2xl shadow-xl overflow-hidden max-h-[92vh] flex flex-col">
+          <div className="w-full max-w-2xl bg-white border border-[#E4E6EB] rounded-2xl shadow-xl overflow-hidden max-h-[92vh] flex flex-col">
             <div className="flex items-center justify-between px-6 py-4 border-b border-[#E4E6EB]">
               <h3 className="font-display text-base font-bold text-[#1C1E21]">
                 Create Custom Scheduled Post
@@ -1258,7 +1365,7 @@ export const MonthlyScheduleTable: React.FC<MonthlyScheduleTableProps> = ({
                   Post Body
                 </label>
                 <textarea
-                  rows={5}
+                  rows={4}
                   required
                   value={newBody}
                   onChange={(e) => setNewBody(e.target.value)}
@@ -1278,6 +1385,19 @@ export const MonthlyScheduleTable: React.FC<MonthlyScheduleTableProps> = ({
                   className="w-full px-3 py-2 text-xs font-mono border border-[#CCD0D5] rounded-lg focus:outline-none focus:border-[#1877F2]"
                 />
               </div>
+
+              <MediaUploadField
+                mediaType={newMediaType}
+                mediaUrl={newMediaUrl}
+                mediaPublicId={newMediaPublicId}
+                cloudinaryConfigured={cloudinaryConfigured}
+                apiFetch={apiFetch}
+                onChange={(next) => {
+                  setNewMediaType(next.mediaType);
+                  setNewMediaUrl(next.mediaUrl);
+                  setNewMediaPublicId(next.mediaPublicId);
+                }}
+              />
 
               <div className="flex items-center justify-end gap-2 pt-3 border-t border-[#E4E6EB]">
                 <button

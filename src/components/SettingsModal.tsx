@@ -221,7 +221,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                     : 'Not set (Optional)'}
                 </span>
               </div>
-              <div className="flex items-center justify-between gap-3 py-1">
+              <div className="flex items-center justify-between gap-3 py-1 border-b border-[#E4E6EB]">
                 <span className="text-[#65676B]">Active Publishing Token</span>
                 <span
                   className={`font-medium ${
@@ -233,6 +233,18 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                   {tokenStatus?.hasPermanentStoredToken
                     ? `Encrypted DB Page Token (${tokenStatus.expiresLabel || 'Never Expires'})`
                     : 'Using Environment Token'}
+                </span>
+              </div>
+              <div className="flex items-center justify-between gap-3 py-1">
+                <span className="font-mono text-[#65676B]">CLOUDINARY_CLOUD_NAME</span>
+                <span
+                  className={`font-mono font-medium ${
+                    settings.mediaConfig?.configured ? 'text-emerald-700' : 'text-[#65676B]'
+                  }`}
+                >
+                  {settings.mediaConfig?.configured
+                    ? `${settings.mediaConfig.cloudName} (Media Ready)`
+                    : 'Not set (Image/Video Upload)'}
                 </span>
               </div>
             </div>

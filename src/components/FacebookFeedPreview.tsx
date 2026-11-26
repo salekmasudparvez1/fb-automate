@@ -1,11 +1,13 @@
-import React from 'react';
+import React, { useState } from 'react';
 import {
   CheckCircle2,
   Clock,
   Edit3,
   ExternalLink,
+  Film,
   FlaskConical,
   Globe,
+  Image as ImageIcon,
   Loader2,
   MessageSquare,
   Send,
@@ -30,7 +32,10 @@ interface FacebookFeedPreviewProps {
     | 'status'
     | 'fbPostId'
     | 'isSimulated'
-  >;
+  > & {
+    mediaType?: ScheduledPost['mediaType'];
+    mediaUrl?: string;
+  };
   pageName?: string;
   compact?: boolean;
   dryRunMode?: boolean;
@@ -48,6 +53,7 @@ export const FacebookFeedPreview: React.FC<FacebookFeedPreviewProps> = ({
   onPublishNow,
   onEdit,
 }) => {
+  const [imgBroken, setImgBroken] = useState(false);
   const displayTags = post.seoTags
     .map((t) => (t.startsWith('#') ? t : `#${t.replace(/^#+/, '')}`))
     .join(' ');
@@ -126,6 +132,42 @@ export const FacebookFeedPreview: React.FC<FacebookFeedPreviewProps> = ({
           </div>
         )}
       </div>
+
+      {/* Attached Image or Video Media */}
+      {post.mediaUrl && post.mediaType === 'image' && (
+        <div className="bg-[#F0F2F5] border-t border-[#E4E6EB] overflow-hidden">
+          {imgBroken ? (
+            <div className="py-10 px-4 text-center text-xs text-[#65676B] flex flex-col items-center gap-1.5">
+              <ImageIcon className="w-6 h-6 text-[#8D949E]" />
+              <span className="font-medium text-[#1C1E21]">{post.seoTitle}</span>
+              <span className="text-[11px] truncate max-w-full">{post.mediaUrl}</span>
+            </div>
+          ) : (
+            <img
+              src={post.mediaUrl}
+              alt={post.seoTitle}
+              referrerPolicy="no-referrer"
+              onError={() => setImgBroken(true)}
+              className="w-full max-h-72 object-cover block"
+            />
+          )}
+        </div>
+      )}
+
+      {post.mediaUrl && post.mediaType === 'video' && (
+        <div className="bg-black border-t border-[#E4E6EB] overflow-hidden">
+          <video
+            src={post.mediaUrl}
+            controls
+            preload="metadata"
+            className="w-full max-h-72 object-contain mx-auto block"
+          />
+          <div className="px-3 py-1.5 bg-[#1C1E21] text-[11px] text-white/80 flex items-center gap-1.5">
+            <Film className="w-3 h-3 shrink-0" />
+            <span className="truncate">Scheduled Video Attachment</span>
+          </div>
+        </div>
+      )}
 
       {/* Quiet Topic Metadata Line */}
       <div className="px-4 py-2 border-t border-[#E4E6EB] bg-[#F7F8FA] flex flex-wrap items-center justify-between gap-2 text-xs text-[#65676B]">

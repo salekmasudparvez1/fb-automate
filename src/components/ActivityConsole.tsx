@@ -112,7 +112,7 @@ export const ActivityConsole: React.FC<ActivityConsoleProps> = ({
                 <div className="flex items-center gap-2 text-[11px] font-mono tabular-nums text-[#65676B]">
                   <span>{formatShortTime(entry.timestamp)}</span>
                   <span aria-hidden="true">·</span>
-                  <span className="uppercase font-medium">
+                  <span className="capitalize font-medium">
                     {entry.category}
                   </span>
                 </div>
